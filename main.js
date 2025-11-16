@@ -35,6 +35,22 @@ const audioSourceSelect = document.getElementById('audio-source');
 const playPauseBtn = document.getElementById('play-pause-btn');
 const smoothingSlider = document.getElementById('smoothing-slider');
 const smoothingValue = document.getElementById('smoothing-value');
+const viewLengthSelect = document.getElementById('view-length');
+
+// Hardcoded BPM
+const HARDCODED_BPM = 140;
+
+// Oscilloscope canvas setup
+const oscilloscopeCanvas = document.getElementById('oscilloscope-canvas');
+const oscilloscopeCtx = oscilloscopeCanvas ? oscilloscopeCanvas.getContext('2d') : null;
+const oscilloscopeContainer = oscilloscopeCanvas ? oscilloscopeCanvas.parentElement : null;
+
+// Oscilloscope state
+let waveformBuffer = []; // Circular buffer for waveform samples
+let waveformBufferSize = 0; // Maximum buffer size (calculated based on view duration)
+let waveformWriteIndex = 0; // Current write position in buffer
+let waveformSamplesPerPixel = 1; // How many samples per pixel (for downsampling)
+const OSCILLOSCOPE_ASPECT_RATIO = 4; // 800x200 = 4:1
 
 // EMA smoothing alpha value (0-1, where lower = more smoothing, higher = less smoothing)
 // Default: 0.5 (moderate smoothing)
@@ -159,6 +175,9 @@ function initializeAudioContext() {
         smoothedData = new Float32Array(frequencyBinCount);
         
         // Initialize smoothed data array (will be populated on first update)
+        
+        // Initialize waveform buffer size
+        updateWaveformBufferSize();
     }
     return { audioContext, analyser };
 }
@@ -463,6 +482,259 @@ function updateEMA(fftData, smoothed, alpha) {
 }
 
 /**
+ * Calculate view duration in seconds based on BPM and number of bars
+ * @param {number} bpm - Beats per minute
+ * @param {number} bars - Number of bars (1, 4, or 8)
+ * @returns {number} Duration in seconds
+ */
+function calculateViewDuration(bpm, bars) {
+    const beats = bars * 4; // 4 beats per bar
+    const durationSeconds = (beats / bpm) * 60;
+    return durationSeconds;
+}
+
+/**
+ * Update waveform buffer size based on current view duration
+ */
+function updateWaveformBufferSize() {
+    if (!analyser || !audioContext) return;
+    
+    const bpm = HARDCODED_BPM;
+    const bars = parseInt(viewLengthSelect.value) || 4;
+    const viewDuration = calculateViewDuration(bpm, bars);
+    
+    const sampleRate = getSampleRate();
+    const canvasWidth = oscilloscopeCanvas ? oscilloscopeCanvas.width : 800;
+    
+    // Calculate how many samples we need to store
+    const totalSamplesNeeded = Math.ceil(viewDuration * sampleRate);
+    
+    // Calculate samples per pixel for downsampling
+    waveformSamplesPerPixel = Math.max(1, Math.floor(totalSamplesNeeded / canvasWidth));
+    
+    // Buffer size should be at least the number of pixels (for scrolling)
+    waveformBufferSize = Math.max(canvasWidth, totalSamplesNeeded);
+    
+    // Resize buffer if needed
+    if (waveformBuffer.length !== waveformBufferSize) {
+        const oldBuffer = waveformBuffer;
+        waveformBuffer = new Array(waveformBufferSize).fill(0);
+        
+        // Copy old data if buffer is growing (preserve recent history)
+        if (oldBuffer.length > 0) {
+            const copyLength = Math.min(oldBuffer.length, waveformBufferSize);
+            const oldStart = Math.max(0, oldBuffer.length - copyLength);
+            for (let i = 0; i < copyLength; i++) {
+                waveformBuffer[waveformBufferSize - copyLength + i] = oldBuffer[oldStart + i];
+            }
+        }
+        
+        waveformWriteIndex = 0;
+    }
+}
+
+/**
+ * Update waveform buffer with new time-domain data
+ */
+function updateWaveform() {
+    if (!analyser || !oscilloscopeCtx) return;
+    
+    // Get time-domain data (raw audio samples)
+    const bufferLength = analyser.fftSize;
+    const timeData = new Float32Array(bufferLength);
+    analyser.getFloatTimeDomainData(timeData);
+    
+    // Downsample and add to buffer
+    for (let i = 0; i < timeData.length; i += waveformSamplesPerPixel) {
+        // Average samples for this pixel
+        let sum = 0;
+        let count = 0;
+        for (let j = 0; j < waveformSamplesPerPixel && (i + j) < timeData.length; j++) {
+            sum += timeData[i + j];
+            count++;
+        }
+        const avg = count > 0 ? sum / count : 0;
+        
+        // Store in circular buffer
+        waveformBuffer[waveformWriteIndex] = avg;
+        waveformWriteIndex = (waveformWriteIndex + 1) % waveformBufferSize;
+    }
+}
+
+/**
+ * Get color for waveform based on frequency content at a given sample
+ * Uses FFT data to determine frequency coloring
+ * @param {number} sampleIndex - Index in the waveform buffer
+ * @param {number} bufferLength - Total buffer length
+ * @returns {string} CSS color string
+ */
+function getWaveformColor(sampleIndex, bufferLength) {
+    if (!fftData || !smoothedData || smoothedData.length === 0) {
+        // Default high-contrast color if no FFT data
+        return '#3b82f6'; // blue-500
+    }
+    
+    // Map sample position to frequency bin (approximate)
+    // Lower frequencies are typically more prominent in the waveform
+    // We'll use a simple mapping: earlier samples = lower frequencies
+    const normalizedPos = sampleIndex / bufferLength;
+    
+    // Map to frequency bins (inverse: lower position = lower frequency)
+    const freqBinIndex = Math.floor((1 - normalizedPos) * smoothedData.length);
+    const binIndex = Math.max(0, Math.min(smoothedData.length - 1, freqBinIndex));
+    
+    // Get energy level from FFT data
+    const energy = smoothedData[binIndex];
+    const normalizedEnergy = isFinite(energy) ? Math.max(0, Math.min(1, (energy - MIN_DB) / (MAX_DB - MIN_DB))) : 0;
+    
+    // Color scheme: lows (blue) -> mids (purple) -> highs (red)
+    // Based on position in buffer and energy
+    if (normalizedPos < 0.33) {
+        // Low frequencies - blue to cyan
+        const intensity = 0.4 + normalizedEnergy * 0.6;
+        return `rgba(59, 130, 246, ${intensity})`; // blue-500
+    } else if (normalizedPos < 0.66) {
+        // Mid frequencies - purple
+        const intensity = 0.4 + normalizedEnergy * 0.6;
+        return `rgba(168, 85, 247, ${intensity})`; // purple-500
+    } else {
+        // High frequencies - red to orange
+        const intensity = 0.4 + normalizedEnergy * 0.6;
+        return `rgba(239, 68, 68, ${intensity})`; // red-500
+    }
+}
+
+/**
+ * Draw the oscilloscope waveform
+ */
+function drawOscilloscope() {
+    if (!oscilloscopeCtx || !oscilloscopeCanvas || waveformBuffer.length === 0) {
+        return;
+    }
+    
+    const width = oscilloscopeCanvas.width;
+    const height = oscilloscopeCanvas.height;
+    const centerY = height / 2;
+    
+    // Clear canvas
+    oscilloscopeCtx.fillStyle = '#030712'; // gray-950
+    oscilloscopeCtx.fillRect(0, 0, width, height);
+    
+    // Draw zero-crossing line
+    oscilloscopeCtx.strokeStyle = 'rgba(107, 114, 128, 0.3)'; // gray-500 with transparency
+    oscilloscopeCtx.lineWidth = 1;
+    oscilloscopeCtx.beginPath();
+    oscilloscopeCtx.moveTo(0, centerY);
+    oscilloscopeCtx.lineTo(width, centerY);
+    oscilloscopeCtx.stroke();
+    
+    // Draw waveform (scrolling from right to left)
+    // Most recent data appears on the right, older data scrolls left
+    const pixelsToDraw = Math.min(width, waveformBuffer.length);
+    
+    if (pixelsToDraw === 0) return;
+    
+    // Build arrays for top path (for filled waveform) and line path
+    const topPath = [];
+    const linePath = [];
+    
+    // Read from buffer: most recent data appears on the right, scrolling left
+    // We want newest data (rightmost) to oldest data (leftmost)
+    for (let x = 0; x < pixelsToDraw; x++) {
+        // Calculate buffer index: read from newest (at writeIndex-1) to oldest
+        // x=0 (rightmost) = newest data, x=pixelsToDraw-1 (leftmost) = oldest visible data
+        // Newest is at (writeIndex - 1), oldest visible is at (writeIndex - pixelsToDraw)
+        const bufferIndex = (waveformWriteIndex - 1 - x + waveformBufferSize) % waveformBufferSize;
+        const sample = waveformBuffer[bufferIndex];
+        
+        // Convert sample (-1 to 1) to Y coordinate
+        const amplitude = Math.max(-1, Math.min(1, sample));
+        const y = centerY - (amplitude * (height * 0.4)); // Use 80% of height for waveform
+        
+        // Canvas X position: newest data (x=0) goes to rightmost (width-1)
+        const canvasX = width - x - 1;
+        
+        linePath.push({ x: canvasX, y: y, bufferIndex: bufferIndex });
+        topPath.push({ x: canvasX, y: y });
+    }
+    
+    // Draw filled waveform with gradient
+    if (topPath.length > 0) {
+        oscilloscopeCtx.beginPath();
+        
+        // Draw top path (waveform line)
+        oscilloscopeCtx.moveTo(topPath[0].x, topPath[0].y);
+        for (let i = 1; i < topPath.length; i++) {
+            oscilloscopeCtx.lineTo(topPath[i].x, topPath[i].y);
+        }
+        
+        // Close path to center line for fill
+        const lastX = topPath[topPath.length - 1].x;
+        oscilloscopeCtx.lineTo(lastX, centerY);
+        oscilloscopeCtx.lineTo(topPath[0].x, centerY);
+        oscilloscopeCtx.closePath();
+        
+        // Create gradient fill (left to right: blue -> purple -> red)
+        const gradient = oscilloscopeCtx.createLinearGradient(0, 0, width, 0);
+        gradient.addColorStop(0, 'rgba(59, 130, 246, 0.6)');   // blue-500 (left/old)
+        gradient.addColorStop(0.5, 'rgba(168, 85, 247, 0.6)'); // purple-500 (middle)
+        gradient.addColorStop(1, 'rgba(239, 68, 68, 0.6)');     // red-500 (right/new)
+        
+        oscilloscopeCtx.fillStyle = gradient;
+        oscilloscopeCtx.fill();
+    }
+    
+    // Draw waveform line with smooth continuous path
+    if (linePath.length > 1) {
+        oscilloscopeCtx.beginPath();
+        oscilloscopeCtx.moveTo(linePath[0].x, linePath[0].y);
+        
+        for (let i = 1; i < linePath.length; i++) {
+            oscilloscopeCtx.lineTo(linePath[i].x, linePath[i].y);
+        }
+        
+        // Use gradient for line color too (for visual consistency)
+        const lineGradient = oscilloscopeCtx.createLinearGradient(0, 0, width, 0);
+        lineGradient.addColorStop(0, 'rgba(59, 130, 246, 1)');   // blue-500
+        lineGradient.addColorStop(0.5, 'rgba(168, 85, 247, 1)'); // purple-500
+        lineGradient.addColorStop(1, 'rgba(239, 68, 68, 1)');     // red-500
+        
+        oscilloscopeCtx.strokeStyle = lineGradient;
+        oscilloscopeCtx.lineWidth = 2;
+        oscilloscopeCtx.stroke();
+    }
+}
+
+/**
+ * Resize oscilloscope canvas to match container size
+ */
+function resizeOscilloscopeCanvas() {
+    if (!oscilloscopeCanvas || !oscilloscopeContainer) return;
+    
+    const containerWidth = oscilloscopeContainer.clientWidth;
+    const containerHeight = oscilloscopeContainer.clientHeight;
+    
+    let newWidth = containerWidth;
+    let newHeight = containerWidth / OSCILLOSCOPE_ASPECT_RATIO;
+    
+    if (newHeight > containerHeight) {
+        newHeight = containerHeight;
+        newWidth = containerHeight * OSCILLOSCOPE_ASPECT_RATIO;
+    }
+    
+    oscilloscopeCanvas.width = newWidth;
+    oscilloscopeCanvas.height = newHeight;
+    
+    // Update buffer size when canvas resizes
+    updateWaveformBufferSize();
+    
+    // Redraw if we have data
+    if (waveformBuffer.length > 0) {
+        drawOscilloscope();
+    }
+}
+
+/**
  * Update function: Read FFT data from analyser and apply smoothing
  */
 function update() {
@@ -523,6 +795,9 @@ function update() {
             console.warn('Update: No smoothedData array available');
         }
     }
+    
+    // Update waveform buffer
+    updateWaveform();
 }
 
 /**
@@ -815,6 +1090,9 @@ function draw() {
     
     // Draw dB scale markers on the left
     drawDbMarkers(ctx, canvas.width, canvas.height);
+    
+    // Draw oscilloscope
+    drawOscilloscope();
 }
 
 let frameCount = 0;
@@ -1023,16 +1301,26 @@ function handleSmoothingChange() {
     console.log(`Smoothing updated: ${Math.round(sliderValue)}% -> alpha = ${emaAlpha.toFixed(3)}`);
 }
 
+/**
+ * Handle view length dropdown change
+ */
+function handleViewLengthChange() {
+    updateWaveformBufferSize();
+    console.log('View length updated');
+}
+
 // Event listeners
 playPauseBtn.addEventListener('click', handlePlayPause);
 audioSourceSelect.addEventListener('change', handleAudioSourceChange);
 smoothingSlider.addEventListener('input', handleSmoothingChange);
+viewLengthSelect.addEventListener('change', handleViewLengthChange);
 
 // Initialize alpha from slider's initial value
 handleSmoothingChange();
 
 // Initialize canvas size
 resizeCanvas();
+resizeOscilloscopeCanvas();
 
 // Test canvas rendering
 if (ctx && canvas) {
@@ -1050,12 +1338,29 @@ if (ctx && canvas) {
     ctx.fillText('Canvas ready - Click Play to start visualization', canvas.width / 2, canvas.height / 2);
 }
 
+// Test oscilloscope canvas rendering
+if (oscilloscopeCtx && oscilloscopeCanvas) {
+    console.log('Oscilloscope canvas initialized:', {
+        width: oscilloscopeCanvas.width,
+        height: oscilloscopeCanvas.height,
+        hasContext: !!oscilloscopeCtx
+    });
+    // Draw a test pattern
+    oscilloscopeCtx.fillStyle = '#1f2937';
+    oscilloscopeCtx.fillRect(0, 0, oscilloscopeCanvas.width, oscilloscopeCanvas.height);
+    oscilloscopeCtx.fillStyle = '#ffffff';
+    oscilloscopeCtx.font = '14px system-ui';
+    oscilloscopeCtx.textAlign = 'center';
+    oscilloscopeCtx.fillText('Oscilloscope ready - Click Play to start', oscilloscopeCanvas.width / 2, oscilloscopeCanvas.height / 2);
+}
+
 // Add window resize event listener with debouncing
 let resizeTimeout;
 window.addEventListener('resize', () => {
     clearTimeout(resizeTimeout);
     resizeTimeout = setTimeout(() => {
         resizeCanvas();
+        resizeOscilloscopeCanvas();
     }, 100); // Debounce resize events
 });
 
