@@ -9,6 +9,12 @@ A web-based real-time spectrum analyzer for audio visualization.
 - Exponential Moving Average (EMA) smoothing
 - Gradient-filled spectrum visualization
 - Frequency markers at 100 Hz, 1 kHz, and 10 kHz
+- **Oscilloscope waveform visualization** with frequency-based color mapping
+- **Advanced Spectral Energy Density Band Visualizer** with 17 logarithmically-spaced bands
+  - Per-band RMS energy calculation
+  - Customizable thresholds, decay rates, and color mapping
+  - Peak hold indicators for each band
+  - Decay system linked to global smoothing factor
 - Responsive canvas resizing
 - Test audio file support
 
@@ -24,46 +30,22 @@ A web-based real-time spectrum analyzer for audio visualization.
    http://localhost:8000
    ```
 
-## Converting Audio Files
+## Audio Format Support
 
-If you encounter issues with WAV files, you can convert them to MP3:
-
-### Using the conversion script:
-
-```bash
-./convert_to_mp3.sh
-```
-
-This will convert `TEST AUDIO/D#m - 140BPM - Triple M v3.wav` to MP3 format.
-
-### Manual conversion with ffmpeg:
-
-```bash
-ffmpeg -i "TEST AUDIO/D#m - 140BPM - Triple M v3.wav" -codec:a libmp3lame -qscale:a 2 "TEST AUDIO/D#m - 140BPM - Triple M v3.mp3"
-```
-
-### Installing ffmpeg:
-
-**macOS:**
-```bash
-brew install ffmpeg
-```
-
-**Linux:**
-```bash
-sudo apt-get install ffmpeg  # Debian/Ubuntu
-sudo yum install ffmpeg      # CentOS/RHEL
-```
-
-**Windows:**
-Download from [ffmpeg.org](https://ffmpeg.org/download.html)
+- **MP3**: Fully supported and working
+- **WAV**: Support is on the backlog (currently may have compatibility issues in some browsers)
 
 ## Usage
 
 1. Select an audio file from the dropdown
 2. Click "Play" to start playback
 3. Adjust the smoothing slider to control EMA smoothing (0-100%)
-4. Watch the real-time spectrum visualization
+   - This affects both the spectrogram and the energy density bands decay rates
+4. Watch the real-time visualizations:
+   - **Spectrogram**: Main frequency spectrum with logarithmic scale
+   - **Energy Density Bands**: 17-band energy visualization with peak hold indicators
+   - **Oscilloscope**: Time-domain waveform with frequency-based coloring
+5. Adjust the view length dropdown to change the oscilloscope time window (1, 4, or 8 bars)
 
 ## Browser Compatibility
 
@@ -76,7 +58,7 @@ Download from [ffmpeg.org](https://ffmpeg.org/download.html)
 ### Audio not playing:
 - Check browser console for errors
 - Verify audio file path is correct
-- Try converting WAV to MP3 if format errors occur
+- Use MP3 format (WAV support is on the backlog)
 - Ensure file is accessible via HTTP server
 
 ### Spectrum not displaying:
