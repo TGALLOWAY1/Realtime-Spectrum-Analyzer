@@ -128,6 +128,25 @@
     </div>
 
     <script type="module" src="./main.js"></script>
+    
+    <!-- Band Tooltip - Fixed position for guaranteed visibility -->
+    <div
+        id="bandTooltip"
+        style="
+            position: fixed;
+            pointer-events: none;
+            padding: 4px 8px;
+            border-radius: 4px;
+            background: rgba(15, 23, 42, 0.95);
+            color: #fefce8;
+            font-size: 11px;
+            line-height: 1.3;
+            display: none;
+            z-index: 9999;
+            border: 1px solid #facc15;
+            white-space: nowrap;
+        "
+    ></div>
 </body>
 </html>
 
