@@ -45,7 +45,11 @@ const HARDCODED_BPM = 140;
 // Oscilloscope canvas setup
 const oscilloscopeCanvas = document.getElementById('oscilloscope-canvas');
 const oscilloscopeCtx = oscilloscopeCanvas ? oscilloscopeCanvas.getContext('2d') : null;
-const oscilloscopeContainer = oscilloscopeCanvas ? oscilloscopeCanvas.parentElement : null;
+const oscilloscopeContainer = oscilloscopeCanvas ? oscilloscopeCanvas.parentElement?.parentElement : null; // Parent is now the flex container
+
+// Oscilloscope axis canvas setup
+const oscilloscopeAxisCanvas = document.getElementById('oscilloscope-axis-canvas');
+const oscilloscopeAxisCtx = oscilloscopeAxisCanvas ? oscilloscopeAxisCanvas.getContext('2d') : null;
 
 // Oscilloscope state
 let waveformBuffer = []; // Circular buffer for waveform samples
@@ -493,9 +497,6 @@ function setupTestAudio(audioPath) {
                 userMessage += '\n\nPossible causes:\n- File not found\n- CORS issue\n- Network problem';
             } else if (error.code === 3 || error.code === 4) {
                 userMessage += '\n\nPossible causes:\n- Audio format not supported\n- File is corrupted';
-                if (audioPath.endsWith('.wav')) {
-                    userMessage += '\n\nTip: Try converting to MP3 using: ./convert_to_mp3.sh';
-                }
             }
             userMessage += `\n\nFile: ${audioPath}`;
             
@@ -860,6 +861,117 @@ function getWaveformColor(sampleIndex, bufferLength) {
 }
 
 /**
+ * Draw the amplitude axis with dBFS tick marks
+ * Shows -INF at center line and one reference line at 0 dBFS (full scale)
+ * @param {CanvasRenderingContext2D} ctx - Canvas rendering context
+ * @param {number} width - Canvas width
+ * @param {number} height - Canvas height
+ */
+function drawAmplitudeAxis(ctx, width, height) {
+    if (!ctx) return;
+    
+    const centerY = height / 2;
+    const waveformHeight = height * 0.4; // 80% of height for waveform (40% above and below center)
+    
+    // Clear canvas
+    ctx.fillStyle = '#030712'; // gray-950
+    ctx.fillRect(0, 0, width, height);
+    
+    // Set up drawing style (matching existing UI)
+    ctx.strokeStyle = '#4b5563'; // gray-600
+    ctx.lineWidth = 1;
+    ctx.font = '11px system-ui, -apple-system, sans-serif';
+    ctx.fillStyle = '#9ca3af'; // gray-400
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    
+    // Draw center line (-INF at 0 amplitude)
+    const tickStartX = 2; // Start 2px from left edge
+    const tickEndX = width - 2; // End 2px from right edge
+    
+    ctx.strokeStyle = 'rgba(107, 114, 128, 0.5)'; // gray-500 with transparency
+    ctx.beginPath();
+    ctx.moveTo(tickStartX, centerY);
+    ctx.lineTo(tickEndX, centerY);
+    ctx.stroke();
+    
+    // Draw -INF label at center
+    const centerLabel = '-INF';
+    const labelX = 4; // Position label 4px from left edge
+    const centerTextHeight = 12;
+    const centerPadding = 2;
+    
+    // Measure text to ensure it fits
+    const centerTextMetrics = ctx.measureText(centerLabel);
+    const centerTextWidth = centerTextMetrics.width;
+    
+    // Draw label background (ensure it doesn't exceed canvas width)
+    const bgWidth = Math.min(centerTextWidth + centerPadding * 2, width - labelX - 2);
+    ctx.fillStyle = 'rgba(3, 7, 18, 0.7)'; // gray-950 with transparency
+    ctx.fillRect(
+        labelX,
+        centerY - centerTextHeight / 2 - 1,
+        bgWidth,
+        centerTextHeight + 2
+    );
+    
+    // Draw center label text
+    ctx.fillStyle = '#9ca3af'; // gray-400
+    ctx.fillText(centerLabel, labelX + centerPadding, centerY);
+    
+    // Draw reference line at 0 dBFS (full scale, top of waveform area)
+    // 0 dBFS = amplitude 1.0, maps to top: centerY - waveformHeight
+    const referenceY = centerY - waveformHeight;
+    
+    ctx.strokeStyle = '#4b5563'; // gray-600
+    ctx.beginPath();
+    ctx.moveTo(tickStartX, referenceY);
+    ctx.lineTo(tickEndX, referenceY);
+    ctx.stroke();
+    
+    // Draw 0 dBFS label
+    const referenceLabel = '0 dBFS';
+    const referenceTextMetrics = ctx.measureText(referenceLabel);
+    const referenceTextWidth = referenceTextMetrics.width;
+    
+    // Draw label background (ensure it doesn't exceed canvas width)
+    const refBgWidth = Math.min(referenceTextWidth + centerPadding * 2, width - labelX - 2);
+    ctx.fillStyle = 'rgba(3, 7, 18, 0.7)';
+    ctx.fillRect(
+        labelX,
+        referenceY - centerTextHeight / 2 - 1,
+        refBgWidth,
+        centerTextHeight + 2
+    );
+    
+    ctx.fillStyle = '#9ca3af';
+    ctx.fillText(referenceLabel, labelX + centerPadding, referenceY);
+    
+    // Draw second reference line at 0 dBFS (full scale, bottom of waveform area)
+    // 0 dBFS = amplitude 1.0, maps to bottom: centerY + waveformHeight
+    const referenceYBottom = centerY + waveformHeight;
+    
+    ctx.strokeStyle = '#4b5563'; // gray-600
+    ctx.beginPath();
+    ctx.moveTo(tickStartX, referenceYBottom);
+    ctx.lineTo(tickEndX, referenceYBottom);
+    ctx.stroke();
+    
+    // Draw 0 dBFS label at bottom
+    const refBgWidthBottom = Math.min(referenceTextWidth + centerPadding * 2, width - labelX - 2);
+    ctx.fillStyle = 'rgba(3, 7, 18, 0.7)';
+    ctx.fillRect(
+        labelX,
+        referenceYBottom - centerTextHeight / 2 - 1,
+        refBgWidthBottom,
+        centerTextHeight + 2
+    );
+    
+    ctx.fillStyle = '#9ca3af';
+    ctx.fillText(referenceLabel, labelX + centerPadding, referenceYBottom);
+}
+
+/**
  * Draw the oscilloscope waveform
  */
 function drawOscilloscope() {
@@ -969,16 +1081,29 @@ function resizeOscilloscopeCanvas() {
     const containerWidth = oscilloscopeContainer.clientWidth;
     const containerHeight = oscilloscopeContainer.clientHeight;
     
-    let newWidth = containerWidth;
-    let newHeight = containerWidth / OSCILLOSCOPE_ASPECT_RATIO;
+    // Fixed width for axis canvas (50px to accommodate labels)
+    const axisWidth = 50;
+    
+    // Calculate waveform canvas dimensions
+    // Account for axis width and gap (gap-2 in Tailwind = 0.5rem = 8px)
+    const availableWidth = containerWidth - axisWidth - 8; // 8px gap
+    let newWidth = availableWidth;
+    let newHeight = availableWidth / OSCILLOSCOPE_ASPECT_RATIO;
     
     if (newHeight > containerHeight) {
         newHeight = containerHeight;
         newWidth = containerHeight * OSCILLOSCOPE_ASPECT_RATIO;
     }
     
+    // Resize waveform canvas
     oscilloscopeCanvas.width = newWidth;
     oscilloscopeCanvas.height = newHeight;
+    
+    // Resize axis canvas (fixed width, same height as waveform)
+    if (oscilloscopeAxisCanvas) {
+        oscilloscopeAxisCanvas.width = axisWidth;
+        oscilloscopeAxisCanvas.height = newHeight;
+    }
     
     // Update buffer size when canvas resizes
     updateWaveformBufferSize();
@@ -986,6 +1111,11 @@ function resizeOscilloscopeCanvas() {
     // Redraw if we have data
     if (waveformBuffer.length > 0) {
         drawOscilloscope();
+    }
+    
+    // Always redraw axis (it's static)
+    if (oscilloscopeAxisCtx && oscilloscopeAxisCanvas) {
+        drawAmplitudeAxis(oscilloscopeAxisCtx, oscilloscopeAxisCanvas.width, oscilloscopeAxisCanvas.height);
     }
 }
 
@@ -1571,6 +1701,11 @@ function draw() {
     // Draw band visualizer
     drawBandVisualizer();
     
+    // Draw oscilloscope amplitude axis (static, redraws every frame)
+    if (oscilloscopeAxisCtx && oscilloscopeAxisCanvas) {
+        drawAmplitudeAxis(oscilloscopeAxisCtx, oscilloscopeAxisCanvas.width, oscilloscopeAxisCanvas.height);
+    }
+    
     // Draw oscilloscope
     drawOscilloscope();
 }
@@ -1858,6 +1993,17 @@ if (oscilloscopeCtx && oscilloscopeCanvas) {
     oscilloscopeCtx.font = '14px system-ui';
     oscilloscopeCtx.textAlign = 'center';
     oscilloscopeCtx.fillText('Oscilloscope ready - Click Play to start', oscilloscopeCanvas.width / 2, oscilloscopeCanvas.height / 2);
+}
+
+// Initialize oscilloscope axis canvas
+if (oscilloscopeAxisCtx && oscilloscopeAxisCanvas) {
+    console.log('Oscilloscope axis canvas initialized:', {
+        width: oscilloscopeAxisCanvas.width,
+        height: oscilloscopeAxisCanvas.height,
+        hasContext: !!oscilloscopeAxisCtx
+    });
+    // Draw the amplitude axis immediately
+    drawAmplitudeAxis(oscilloscopeAxisCtx, oscilloscopeAxisCanvas.width, oscilloscopeAxisCanvas.height);
 }
 
 // Test band visualizer canvas rendering
