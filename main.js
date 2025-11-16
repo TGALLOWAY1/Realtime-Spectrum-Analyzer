@@ -36,6 +36,8 @@ const playPauseBtn = document.getElementById('play-pause-btn');
 const smoothingSlider = document.getElementById('smoothing-slider');
 const smoothingValue = document.getElementById('smoothing-value');
 const viewLengthSelect = document.getElementById('view-length');
+const decaySpeedSlider = document.getElementById('decay-speed-slider');
+const decaySpeedValue = document.getElementById('decay-speed-value');
 
 // Hardcoded BPM
 const HARDCODED_BPM = 140;
@@ -97,6 +99,79 @@ function generateLogBands(count, minFreq, maxFreq) {
 // Initialize band definitions
 let bandDefinitions = generateLogBands(BAND_COUNT, BAND_MIN_FREQ, BAND_MAX_FREQ);
 
+/**
+ * Compute bin indices for each band and ensure every band has at least one bin
+ * Called after audio context is initialized
+ */
+function computeBandBinIndices() {
+    if (!audioContext || !analyser || !frequencyBinCount) {
+        return;
+    }
+    
+    const sampleRate = audioContext.sampleRate;
+    const fftSize = analyser.fftSize;
+    const freqPerBin = sampleRate / fftSize;
+    
+    // Compute bin indices for each band
+    for (let i = 0; i < bandDefinitions.length; i++) {
+        const band = bandDefinitions[i];
+        
+        // Calculate start and end bin indices from frequencies
+        // Formula: binIndex = (freq * fftSize) / sampleRate
+        let startBin = Math.floor((band.min * fftSize) / sampleRate);
+        let endBin = Math.ceil((band.max * fftSize) / sampleRate);
+        
+        // Clamp to valid bin range [0, frequencyBinCount)
+        startBin = Math.max(0, Math.min(startBin, frequencyBinCount - 1));
+        endBin = Math.max(0, Math.min(endBin, frequencyBinCount - 1));
+        
+        // Ensure endBin >= startBin (at least one bin)
+        if (endBin < startBin) {
+            endBin = startBin;
+        }
+        
+        // Ensure every band has at least one bin
+        // If the band has zero width (endBin === startBin), expand it
+        if (endBin === startBin) {
+            // Try to expand endBin if possible
+            if (endBin < frequencyBinCount - 1) {
+                endBin = startBin + 1;
+            } else if (startBin > 0) {
+                // If we're at the end, move startBin back
+                startBin = endBin - 1;
+            }
+            // If we're at bin 0 and can't expand, keep it as is (at least one bin)
+        }
+        
+        // Calculate bin count
+        const binCount = endBin - startBin + 1;
+        
+        // Store bin indices and count
+        band.startBin = startBin;
+        band.endBin = endBin;
+        band.binCount = binCount;
+        
+        // Also store minFreq and maxFreq for logging (using actual bin frequencies)
+        band.minFreq = (startBin * sampleRate) / fftSize;
+        band.maxFreq = (endBin * sampleRate) / fftSize;
+    }
+    
+    // Log band information once
+    console.log('Band bin mapping computed:', {
+        sampleRate: sampleRate,
+        fftSize: fftSize,
+        frequencyBinCount: frequencyBinCount,
+        freqPerBin: freqPerBin.toFixed(2) + ' Hz'
+    });
+    
+    for (let i = 0; i < bandDefinitions.length; i++) {
+        const band = bandDefinitions[i];
+        console.log(`Band ${i}: minFreq=${band.min.toFixed(1)} Hz, maxFreq=${band.max.toFixed(1)} Hz, ` +
+                   `startBin=${band.startBin}, endBin=${band.endBin}, binCount=${band.binCount}, ` +
+                   `actualFreqRange=${band.minFreq.toFixed(1)}-${band.maxFreq.toFixed(1)} Hz`);
+    }
+}
+
 // Per-band state: current energy, peak hold, and configuration
 let bandStates = [];
 
@@ -130,35 +205,50 @@ function initializeBandStates() {
     for (let i = 0; i < BAND_COUNT; i++) {
         const band = bandDefinitions[i];
         
-        // Default threshold: lower for sub-bass, higher for highs
-        // Sub-bass (first 3 bands): -80 dB, Mids: -70 dB, Highs: -60 dB
+        // Determine category
+        let category;
+        if (i < 3) {
+            category = 'Sub-bass';
+        } else if (i < 12) {
+            category = 'Mids';
+        } else {
+            category = 'Highs';
+        }
+        
+        // Updated thresholds: Sub-bass: -80, Mids: -75, Highs: -78
         let threshold;
         if (i < 3) {
             threshold = -80; // Sub-bass
         } else if (i < 12) {
-            threshold = -70; // Mids
+            threshold = -75; // Mids
         } else {
-            threshold = -60; // Highs
+            threshold = -78; // Highs
         }
         
-        // Default decay multiplier: slower for sub-bass, faster for highs
-        // Sub-bass: 0.5x (slower decay), Mids: 1.0x, Highs: 1.5x (faster decay)
+        // Default decay multiplier: Sub-bass: 0.8x, Mids: 1.2x, Highs: 1.6x
         let decayMultiplier;
         if (i < 3) {
-            decayMultiplier = 0.5; // Sub-bass decays slowly
+            decayMultiplier = 0.8; // Sub-bass
         } else if (i < 12) {
-            decayMultiplier = 1.0; // Mids decay normally
+            decayMultiplier = 1.2; // Mids
         } else {
-            decayMultiplier = 1.5; // Highs decay quickly
+            decayMultiplier = 1.6; // Highs
         }
         
         bandStates.push({
-            currentEnergy: -Infinity, // Current energy in dB
-            peakHold: -Infinity,      // Peak hold value in dB
-            threshold: threshold,     // Threshold in dB (only illuminate if energy > threshold)
+            currentEnergy: -Infinity, // Current energy in dB (raw, before compensation)
+            category: category,       // Category: 'Sub-bass' | 'Mids' | 'Highs'
+            threshold: threshold,     // Threshold in dB
             decayMultiplier: decayMultiplier, // Multiplier for decay rate
             color: defaultColors[i] || '#3b82f6', // Band color
-            peakHoldDecayRate: 0.95   // Peak hold decays slower (95% retention per frame)
+            peakHoldDecayRate: 0.9,   // Peak hold decay rate (90% retention per frame, faster decay)
+            peakValue: 0,              // Normalized peak value [0, 1] for peak cap indicator
+            instantValue: 0,           // Instant normalized value [0, 1] for main bar (no peak hold)
+            // Screen geometry for hover detection
+            screenX: 0,
+            screenY: 0,
+            screenWidth: 0,
+            screenHeight: 0
         });
     }
 }
@@ -166,10 +256,32 @@ function initializeBandStates() {
 // Initialize band states
 initializeBandStates();
 
+/**
+ * Get category gain (tilt compensation) for frequency bands
+ * @param {string} category - Band category: 'Sub-bass' | 'Mids' | 'Highs'
+ * @returns {number} Gain in dB to apply
+ */
+function getCategoryGain(category) {
+    switch (category) {
+        case 'Sub-bass':
+            return 0;   // no boost
+        case 'Mids':
+            return -2;  // small attenuation to avoid constant max
+        case 'Highs':
+            return 3;   // modest boost to keep highs visible
+        default:
+            return 0;
+    }
+}
+
 // EMA smoothing alpha value (0-1, where lower = more smoothing, higher = less smoothing)
 // Default: 0.5 (moderate smoothing)
 let emaAlpha = 0.5;
 let emaInitialized = false;
+
+// Global decay speed multiplier for energy density bands
+// 1.0 = current behavior, >1 = faster decay, <1 = slower decay
+let globalDecaySpeed = 1.0;
 
 // Frequency mapping constants
 const MIN_FREQ = 20;    // 20 Hz
@@ -180,6 +292,10 @@ const MAX_FREQ = 20000; // 20 kHz
 // Some implementations may return slightly positive values, so we allow up to +6 dB for headroom
 const MIN_DB = -100;    // Minimum dB value (silence threshold)
 const MAX_DB = 0;        // Maximum dB value (full scale, 0 dB = maximum digital level)
+
+// Energy density band dynamic range
+// dB window above threshold for full scale (wider range = less pegging)
+const ENERGY_DYNAMIC_RANGE_DB = 40; // dB window above threshold for full scale
 
 // Canvas padding to prevent labels from being cut off
 const CANVAS_PADDING_TOP = 20;    // Space for frequency markers at top
@@ -277,7 +393,29 @@ function computeBinFrequencies() {
  */
 function initializeAudioContext() {
     if (!audioContext) {
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        // Try to create AudioContext at 48 kHz to match the source audio file
+        // If 48 kHz is not supported, fall back to browser default
+        const preferredSampleRate = 48000; // 48 kHz to match source audio
+        
+        try {
+            // Try creating with explicit 48 kHz sample rate
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: preferredSampleRate
+            });
+            
+            // Check if we actually got 48 kHz (some browsers may ignore the request)
+            if (audioContext.sampleRate !== preferredSampleRate) {
+                console.warn(`Requested ${preferredSampleRate} Hz but got ${audioContext.sampleRate} Hz. Browser may not support ${preferredSampleRate} Hz.`);
+            } else {
+                console.log(`AudioContext created at ${audioContext.sampleRate} Hz (matches source audio)`);
+            }
+        } catch (e) {
+            // If explicit sample rate fails, fall back to default
+            console.warn(`Failed to create AudioContext at ${preferredSampleRate} Hz, using browser default:`, e);
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            console.log(`AudioContext created at browser default: ${audioContext.sampleRate} Hz`);
+        }
+        
         analyser = audioContext.createAnalyser();
         analyser.fftSize = 2048;
         
@@ -292,6 +430,9 @@ function initializeAudioContext() {
         
         // Initialize waveform buffer size
         updateWaveformBufferSize();
+        
+        // Compute bin indices for each band
+        computeBandBinIndices();
     }
     return { audioContext, analyser };
 }
@@ -850,51 +991,57 @@ function resizeOscilloscopeCanvas() {
 
 /**
  * Calculate energy (RMS) for a frequency band from FFT data
+ * Uses bin indices (startBin/endBin) if available for efficient computation
  * @param {Float32Array} fftData - FFT frequency data in dB
- * @param {Float32Array} binFrequencies - Array of frequencies for each bin
- * @param {number} minFreq - Minimum frequency of the band
- * @param {number} maxFreq - Maximum frequency of the band
+ * @param {Object} bandDef - Band definition object with startBin, endBin properties
  * @returns {number} Energy in dB (or -Infinity if no energy)
  */
-function calculateBandEnergy(fftData, binFrequencies, minFreq, maxFreq) {
-    if (!fftData || !binFrequencies || fftData.length !== binFrequencies.length) {
+function calculateBandEnergy(fftData, bandDef) {
+    if (!fftData || !bandDef) {
         return -Infinity;
     }
     
-    // Find bins within the frequency range
-    const validBins = [];
-    for (let i = 0; i < fftData.length; i++) {
-        const freq = binFrequencies[i];
-        if (freq >= minFreq && freq <= maxFreq) {
+    // Use bin indices if available, otherwise fall back to frequency-based lookup
+    if (bandDef.startBin != null && bandDef.endBin != null) {
+        // Use bin indices directly (more efficient and accurate)
+        const validBins = [];
+        const startBin = Math.max(0, Math.min(bandDef.startBin, fftData.length - 1));
+        const endBin = Math.max(startBin, Math.min(bandDef.endBin, fftData.length - 1));
+        
+        for (let i = startBin; i <= endBin; i++) {
             const dbValue = fftData[i];
             // Only include finite values (skip -Infinity)
             if (isFinite(dbValue)) {
                 validBins.push(dbValue);
             }
         }
-    }
-    
-    if (validBins.length === 0) {
+        
+        if (validBins.length === 0) {
+            return -Infinity;
+        }
+        
+        // Convert dB to linear scale, calculate RMS, then convert back to dB
+        // RMS in linear: sqrt(sum(x^2) / n)
+        // For dB values: x_linear = 10^(dB/20)
+        let sumSquared = 0;
+        for (let i = 0; i < validBins.length; i++) {
+            const linearValue = Math.pow(10, validBins[i] / 20);
+            sumSquared += linearValue * linearValue;
+        }
+        
+        const rmsLinear = Math.sqrt(sumSquared / validBins.length);
+        const rmsDb = 20 * Math.log10(rmsLinear);
+        
+        return rmsDb;
+    } else {
+        // Fallback to frequency-based lookup (for backwards compatibility)
         return -Infinity;
     }
-    
-    // Convert dB to linear scale, calculate RMS, then convert back to dB
-    // RMS in linear: sqrt(sum(x^2) / n)
-    // For dB values: x_linear = 10^(dB/20)
-    let sumSquared = 0;
-    for (let i = 0; i < validBins.length; i++) {
-        const linearValue = Math.pow(10, validBins[i] / 20);
-        sumSquared += linearValue * linearValue;
-    }
-    
-    const rmsLinear = Math.sqrt(sumSquared / validBins.length);
-    const rmsDb = 20 * Math.log10(rmsLinear);
-    
-    return rmsDb;
 }
 
 /**
  * Update band states with new energy values and apply decay
+ * Uses normalized 0-1 values with category gain compensation
  * @param {Float32Array} fftData - Current FFT data in dB
  * @param {Float32Array} binFrequencies - Array of frequencies for each bin
  */
@@ -903,79 +1050,55 @@ function updateBandStates(fftData, binFrequencies) {
         return;
     }
     
-    // Calculate base decay rate from emaAlpha
-    // emaAlpha is 0.1-0.95 (lower = more smoothing, higher = less smoothing)
-    // For decay, we want: lower alpha (more smoothing) = slower decay (higher retention)
-    // Higher alpha (less smoothing) = faster decay (lower retention)
-    // We'll use an inverse relationship: decayFactor = baseRetention - (alpha * adjustment)
-    
     for (let i = 0; i < bandStates.length; i++) {
         const bandState = bandStates[i];
         const bandDef = bandDefinitions[i];
         
-        // Calculate current energy for this band
-        const newEnergy = calculateBandEnergy(fftData, binFrequencies, bandDef.min, bandDef.max);
+        // 1. Calculate current energy for this band (in dB)
+        const newEnergy = calculateBandEnergy(fftData, bandDef);
         
-        // Update current energy with decay
-        // If new energy is higher, use it immediately
-        // Otherwise, apply decay based on emaAlpha and decayMultiplier
-        if (isFinite(newEnergy) && newEnergy > bandState.currentEnergy) {
+        // Store raw energy for reference
+        if (isFinite(newEnergy)) {
             bandState.currentEnergy = newEnergy;
-        } else {
-            // Apply decay: retention determines how much energy is retained per frame
-            // Lower emaAlpha (more smoothing) = slower decay (higher retention)
-            // Higher decayMultiplier = faster decay for that band
-            // Base retention: 0.92 (moderate), adjusted by alpha and multiplier
-            // When alpha is low (0.1, more smoothing): retention is higher (slower decay)
-            // When alpha is high (0.95, less smoothing): retention is lower (faster decay)
-            const baseRetention = 0.92;
-            // Invert alpha: (1 - emaAlpha) gives higher value when alpha is lower
-            // Scale adjustment: 0.1 means max adjustment of 0.1 when alpha is at extremes
-            const alphaAdjustment = (1 - emaAlpha) * 0.1;
-            // Add adjustment for lower alpha (more smoothing = slower decay)
-            // Subtract multiplier effect (higher multiplier = faster decay)
-            const retention = baseRetention + alphaAdjustment - (bandState.decayMultiplier - 1.0) * 0.05;
-            // Clamp retention to prevent invalid values
-            const clampedRetention = Math.max(0.85, Math.min(0.995, retention));
-            
-            if (isFinite(bandState.currentEnergy)) {
-                // Decay towards threshold (or -Infinity)
-                const targetEnergy = Math.max(bandState.threshold - 20, -Infinity);
-                if (isFinite(targetEnergy)) {
-                    bandState.currentEnergy = bandState.currentEnergy * clampedRetention + targetEnergy * (1 - clampedRetention);
-                } else {
-                    // If target is -Infinity, decay more aggressively
-                    bandState.currentEnergy = bandState.currentEnergy * clampedRetention;
-                }
-            }
         }
         
-        // Update peak hold
-        if (isFinite(newEnergy) && newEnergy > bandState.peakHold) {
-            bandState.peakHold = newEnergy;
+        // 2. Apply category gain (tilt compensation)
+        const categoryGain = getCategoryGain(bandState.category);
+        const compensated = isFinite(newEnergy) ? newEnergy + categoryGain : -Infinity;
+        
+        // 3. Compute how far above threshold (in dB)
+        const above = isFinite(compensated) ? compensated - bandState.threshold : -Infinity;
+        
+        // 4. Normalize to 0-1 using dynamic range window above threshold with gentle curve
+        const linear = isFinite(above) && above > 0 
+            ? Math.max(0, Math.min(1, above / ENERGY_DYNAMIC_RANGE_DB))
+            : 0;
+        
+        // Apply a gentle curve so small values are a bit more visible,
+        // but we don't instantly saturate to 1.0
+        const normalized = Math.pow(linear, 0.8);
+        
+        // 5. Store instant value (drives the main bar, no peak hold)
+        bandState.instantValue = normalized;
+        
+        // 6. Update peakValue with decay logic (only for peak cap indicator)
+        if (normalized > bandState.peakValue) {
+            // If new normalized value is higher, update immediately
+            bandState.peakValue = normalized;
         } else {
-            // Decay peak hold slowly
-            if (isFinite(bandState.peakHold)) {
-                const targetPeak = Math.max(bandState.currentEnergy, bandState.threshold - 20);
-                if (isFinite(targetPeak)) {
-                    bandState.peakHold = bandState.peakHold * bandState.peakHoldDecayRate + targetPeak * (1 - bandState.peakHoldDecayRate);
-                } else {
-                    bandState.peakHold = bandState.peakHold * bandState.peakHoldDecayRate;
-                }
-            }
+            // Otherwise, apply decay based on decayMultiplier and globalDecaySpeed
+            const decayFactor = Math.pow(bandState.peakHoldDecayRate, bandState.decayMultiplier * globalDecaySpeed);
+            bandState.peakValue *= decayFactor;
         }
         
-        // Ensure peak hold doesn't go below current energy
-        if (isFinite(bandState.currentEnergy) && isFinite(bandState.peakHold)) {
-            if (bandState.peakHold < bandState.currentEnergy) {
-                bandState.peakHold = bandState.currentEnergy;
-            }
-        }
+        // Ensure peakValue stays in valid range
+        bandState.peakValue = Math.max(0, Math.min(1, bandState.peakValue));
     }
 }
 
 /**
  * Draw the band visualizer
+ * Uses instantValue for main bar and peakValue for peak cap indicator
  */
 function drawBandVisualizer() {
     if (!bandVisualizerCtx || !bandVisualizerCanvas || bandStates.length === 0) {
@@ -993,47 +1116,30 @@ function drawBandVisualizer() {
     const bandWidth = width / BAND_COUNT;
     const bandHeight = height;
     const padding = 2; // Padding between bands
+    const minVisible = 0.02; // Minimum visible fraction (2% of max height, only for drawing)
     
     // Draw each band
     for (let i = 0; i < BAND_COUNT; i++) {
         const bandState = bandStates[i];
         const x = i * bandWidth;
+        const barX = x + padding;
+        const barWidth = bandWidth - padding * 2;
         
-        // Calculate illumination height based on energy above threshold
-        let illuminationHeight = 0;
-        let peakHoldY = 0;
-        
-        if (isFinite(bandState.currentEnergy) && bandState.currentEnergy > bandState.threshold) {
-            // Calculate how far above threshold the energy is
-            const energyAboveThreshold = bandState.currentEnergy - bandState.threshold;
-            // Normalize to 0-1 range (assuming max energy is 0 dB, threshold is typically -60 to -80 dB)
-            const maxEnergyRange = 0 - bandState.threshold; // e.g., 0 - (-70) = 70 dB
-            const normalizedEnergy = Math.min(1, Math.max(0, energyAboveThreshold / maxEnergyRange));
-            
-            // Illumination height is proportional to energy above threshold
-            illuminationHeight = normalizedEnergy * bandHeight;
-        }
-        
-        // Calculate peak hold position
-        if (isFinite(bandState.peakHold) && bandState.peakHold > bandState.threshold) {
-            const peakAboveThreshold = bandState.peakHold - bandState.threshold;
-            const maxEnergyRange = 0 - bandState.threshold;
-            const normalizedPeak = Math.min(1, Math.max(0, peakAboveThreshold / maxEnergyRange));
-            peakHoldY = bandHeight - (normalizedPeak * bandHeight);
-        } else {
-            peakHoldY = bandHeight; // Off-screen if no peak
-        }
+        // Use instantValue for main bar (no peak hold)
+        const instantValue = bandState.instantValue || 0;
+        const instantDisplay = instantValue > 0 ? Math.max(minVisible, instantValue) : 0;
+        const barHeight = instantDisplay * bandHeight;
         
         // Draw band background (subtle)
         bandVisualizerCtx.fillStyle = 'rgba(31, 41, 55, 0.5)'; // gray-800 with transparency
-        bandVisualizerCtx.fillRect(x + padding, 0, bandWidth - padding * 2, bandHeight);
+        bandVisualizerCtx.fillRect(barX, 0, barWidth, bandHeight);
         
-        // Draw illumination (from bottom up)
-        if (illuminationHeight > 0) {
-            const illuminationY = bandHeight - illuminationHeight;
+        // Draw main bar (from bottom up) using instantValue
+        if (barHeight > 0) {
+            const barY = bandHeight - barHeight;
             
             // Create gradient for amplitude-driven color (brighter at top)
-            const gradient = bandVisualizerCtx.createLinearGradient(x, illuminationY, x, bandHeight);
+            const gradient = bandVisualizerCtx.createLinearGradient(x, barY, x, bandHeight);
             const baseColor = bandState.color;
             
             // Convert hex to RGB
@@ -1041,37 +1147,33 @@ function drawBandVisualizer() {
             const g = parseInt(baseColor.slice(3, 5), 16);
             const b = parseInt(baseColor.slice(5, 7), 16);
             
-            // Top of illumination (brighter)
+            // Top of bar (brighter)
             gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.9)`);
-            // Bottom of illumination (dimmer)
+            // Bottom of bar (dimmer)
             gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0.3)`);
             
             bandVisualizerCtx.fillStyle = gradient;
-            bandVisualizerCtx.fillRect(x + padding, illuminationY, bandWidth - padding * 2, illuminationHeight);
+            bandVisualizerCtx.fillRect(barX, barY, barWidth, barHeight);
         }
         
-        // Draw peak hold marker (thin line at peak position)
-        if (peakHoldY < bandHeight && isFinite(bandState.peakHold)) {
-            bandVisualizerCtx.strokeStyle = '#ffffff'; // White peak marker
-            bandVisualizerCtx.lineWidth = 1;
-            bandVisualizerCtx.beginPath();
-            bandVisualizerCtx.moveTo(x + padding, peakHoldY);
-            bandVisualizerCtx.lineTo(x + bandWidth - padding, peakHoldY);
-            bandVisualizerCtx.stroke();
+        // Draw peak cap indicator (small rectangle at peak height)
+        if (bandState.peakValue > 0) {
+            const peakHeight = bandState.peakValue * bandHeight;
+            const peakY = bandHeight - peakHeight;
+            const capHeight = Math.max(2, bandHeight * 0.02); // Small cap, at least 2px
+            
+            bandVisualizerCtx.fillStyle = 'rgba(255, 255, 255, 0.9)'; // White peak cap
+            bandVisualizerCtx.fillRect(barX, peakY - capHeight, barWidth, capHeight);
         }
         
-        // Draw threshold line (subtle, if energy is below threshold)
-        if (!isFinite(bandState.currentEnergy) || bandState.currentEnergy <= bandState.threshold) {
-            const thresholdY = bandHeight - ((bandState.threshold - MIN_DB) / (MAX_DB - MIN_DB)) * bandHeight;
-            if (thresholdY >= 0 && thresholdY <= bandHeight) {
-                bandVisualizerCtx.strokeStyle = 'rgba(107, 114, 128, 0.2)'; // gray-500 with low opacity
-                bandVisualizerCtx.lineWidth = 0.5;
-                bandVisualizerCtx.beginPath();
-                bandVisualizerCtx.moveTo(x + padding, thresholdY);
-                bandVisualizerCtx.lineTo(x + bandWidth - padding, thresholdY);
-                bandVisualizerCtx.stroke();
-            }
-        }
+        // Store screen geometry for hover detection
+        const bandDef = bandDefinitions[i];
+        bandState.screenX = barX;
+        bandState.screenY = 0;
+        bandState.screenWidth = barWidth;
+        bandState.screenHeight = bandHeight;
+        // Store band definition reference for tooltip
+        bandState.bandDef = bandDef;
     }
 }
 
@@ -1687,14 +1789,39 @@ function handleViewLengthChange() {
     console.log('View length updated');
 }
 
+/**
+ * Handle decay speed slider change
+ */
+function handleDecaySpeedChange() {
+    if (!decaySpeedSlider) return;
+    
+    const raw = parseFloat(decaySpeedSlider.value);
+    
+    if (!Number.isNaN(raw)) {
+        globalDecaySpeed = raw;
+        
+        if (decaySpeedValue) {
+            decaySpeedValue.textContent = raw.toFixed(2);
+        }
+        
+        console.log(`Decay speed updated: ${raw.toFixed(2)}x`);
+    }
+}
+
 // Event listeners
 playPauseBtn.addEventListener('click', handlePlayPause);
 audioSourceSelect.addEventListener('change', handleAudioSourceChange);
 smoothingSlider.addEventListener('input', handleSmoothingChange);
 viewLengthSelect.addEventListener('change', handleViewLengthChange);
+if (decaySpeedSlider) {
+    decaySpeedSlider.addEventListener('input', handleDecaySpeedChange);
+}
 
 // Initialize alpha from slider's initial value
 handleSmoothingChange();
+
+// Initialize decay speed from slider's initial value
+handleDecaySpeedChange();
 
 // Initialize canvas size
 resizeCanvas();
@@ -1765,5 +1892,91 @@ window.addEventListener('resize', () => {
 const defaultPath = audioSourceSelect.value;
 if (defaultPath) {
     setupTestAudio(defaultPath);
+}
+
+// Tooltip element for band hover
+const tooltip = document.getElementById('bandTooltip');
+
+/**
+ * Get the hovered band based on mouse coordinates
+ * @param {MouseEvent} event - Mouse event
+ * @returns {Object|null} The hovered band state or null
+ */
+function getHoveredBand(event) {
+    if (!bandVisualizerCanvas || !bandStates.length) return null;
+    
+    const rect = bandVisualizerCanvas.getBoundingClientRect();
+    const scaleX = bandVisualizerCanvas.width / rect.width;
+    const scaleY = bandVisualizerCanvas.height / rect.height;
+    
+    const x = (event.clientX - rect.left) * scaleX;
+    const y = (event.clientY - rect.top) * scaleY;
+    
+    for (const band of bandStates) {
+        if (
+            band.screenX != null &&
+            band.screenY != null &&
+            band.screenWidth != null &&
+            band.screenHeight != null &&
+            x >= band.screenX &&
+            x <= band.screenX + band.screenWidth &&
+            y >= band.screenY &&
+            y <= band.screenY + band.screenHeight
+        ) {
+            return band;
+        }
+    }
+    
+    return null;
+}
+
+/**
+ * Handle mouse move to update tooltip
+ * @param {MouseEvent} event - Mouse event
+ */
+function handleMouseMove(event) {
+    if (!tooltip) return;
+    
+    const hovered = getHoveredBand(event);
+    
+    if (!hovered || !hovered.bandDef) {
+        tooltip.style.display = 'none';
+        return;
+    }
+    
+    const bandDef = hovered.bandDef;
+    if (!bandDef || bandDef.min == null || bandDef.max == null) {
+        tooltip.style.display = 'none';
+        return;
+    }
+    
+    const freqRange = `${bandDef.min.toFixed(1)}–${bandDef.max.toFixed(1)} Hz`;
+    const threshold = hovered.threshold != null ? `${hovered.threshold.toFixed(1)} dB` : 'n/a';
+    const decay = hovered.decayMultiplier != null ? `${hovered.decayMultiplier.toFixed(2)}x` : 'n/a';
+    const peakVal = hovered.peakValue != null ? hovered.peakValue.toFixed(2) : 'n/a';
+    const energyDb = isFinite(hovered.currentEnergy) ? hovered.currentEnergy.toFixed(1) : 'n/a';
+    
+    tooltip.innerHTML = `
+        <div><strong>${hovered.category}</strong></div>
+        <div>Freq: ${freqRange}</div>
+        <div>Energy: ${energyDb} dB</div>
+        <div>Threshold: ${threshold}</div>
+        <div>Decay: ${decay}</div>
+        <div>Peak: ${peakVal}</div>
+    `;
+    
+    tooltip.style.left = `${event.clientX + 12}px`;
+    tooltip.style.top = `${event.clientY + 12}px`;
+    tooltip.style.display = 'block';
+}
+
+// Register mouse event listeners
+if (bandVisualizerCanvas) {
+    bandVisualizerCanvas.addEventListener('mousemove', handleMouseMove);
+    bandVisualizerCanvas.addEventListener('mouseleave', () => {
+        if (tooltip) {
+            tooltip.style.display = 'none';
+        }
+    });
 }
 

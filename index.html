@@ -106,12 +106,47 @@
                             <option value="8">8 Bars</option>
                         </select>
                     </div>
+
+                    <!-- Decay Speed Slider -->
+                    <div class="flex flex-col gap-2 flex-1 min-w-[200px] max-w-md">
+                        <label for="decay-speed-slider" class="text-sm font-medium text-gray-300">
+                            Decay Speed: <span id="decay-speed-value">1.00</span>x
+                        </label>
+                        <input 
+                            type="range" 
+                            id="decay-speed-slider" 
+                            min="0.25" 
+                            max="2.0" 
+                            step="0.05" 
+                            value="1.0" 
+                            class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                        />
+                    </div>
                 </div>
             </div>
         </main>
     </div>
 
     <script type="module" src="./main.js"></script>
+    
+    <!-- Band Tooltip - Fixed position for guaranteed visibility -->
+    <div
+        id="bandTooltip"
+        style="
+            position: fixed;
+            pointer-events: none;
+            padding: 4px 8px;
+            border-radius: 4px;
+            background: rgba(15, 23, 42, 0.95);
+            color: #fefce8;
+            font-size: 11px;
+            line-height: 1.3;
+            display: none;
+            z-index: 9999;
+            border: 1px solid #facc15;
+            white-space: nowrap;
+        "
+    ></div>
 </body>
 </html>
 
