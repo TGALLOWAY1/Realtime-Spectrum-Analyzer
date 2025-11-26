@@ -1,7 +1,8 @@
 # Real-Time Spectrum Analyzer
 
 A web-based real-time spectrum analyzer for audio visualization.
-<img width="737" height="769" alt="image" src="https://github.com/user-attachments/assets/49b191ac-1445-4631-a4c4-76275a13ae7d" />
+<img width="1202" height="1284" alt="image" src="https://github.com/user-attachments/assets/d2f4dda4-b422-40df-88be-5f2f9ee6870a" />
+
 
 ## Features
 
