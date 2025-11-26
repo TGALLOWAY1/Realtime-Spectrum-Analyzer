@@ -23,133 +23,211 @@
                 ></canvas>
             </div>
 
-            <!-- Energy Density Bands Section -->
+            <!-- Multi-Band Vector Scope Section -->
             <div class="mb-6 bg-gray-800 rounded-lg p-4 shadow-lg">
-                <canvas 
-                    id="band-visualizer-canvas" 
-                    class="w-full bg-gray-950 rounded"
-                    width="800" 
-                    height="150"
-                ></canvas>
+                <div class="flex gap-4">
+                    <!-- Sub Band Scope -->
+                    <div class="flex-1 flex flex-col gap-2">
+                        <canvas 
+                            id="scope-sub" 
+                            class="w-full bg-gray-950 rounded"
+                            width="300" 
+                            height="250"
+                        ></canvas>
+                        <label class="text-xs text-gray-400 text-center">Sub (&lt;120Hz)</label>
+                    </div>
+                    
+                    <!-- Low Band Scope -->
+                    <div class="flex-1 flex flex-col gap-2">
+                        <canvas 
+                            id="scope-low" 
+                            class="w-full bg-gray-950 rounded"
+                            width="300" 
+                            height="250"
+                        ></canvas>
+                        <label class="text-xs text-gray-400 text-center">Low (120-250Hz)</label>
+                    </div>
+                    
+                    <!-- Mid Band Scope -->
+                    <div class="flex-1 flex flex-col gap-2">
+                        <canvas 
+                            id="scope-mid" 
+                            class="w-full bg-gray-950 rounded"
+                            width="300" 
+                            height="250"
+                        ></canvas>
+                        <label class="text-xs text-gray-400 text-center">Mid (250-2500Hz)</label>
+                    </div>
+                    
+                    <!-- High Band Scope -->
+                    <div class="flex-1 flex flex-col gap-2">
+                        <canvas 
+                            id="scope-high" 
+                            class="w-full bg-gray-950 rounded"
+                            width="300" 
+                            height="250"
+                        ></canvas>
+                        <label class="text-xs text-gray-400 text-center">High (&gt;2500Hz)</label>
+                    </div>
+                </div>
             </div>
 
             <!-- Oscilloscope Section -->
             <div class="mb-6 bg-gray-800 rounded-lg p-4 shadow-lg">
-                <div class="flex gap-2">
-                    <!-- Amplitude Axis Canvas -->
-                    <canvas 
-                        id="oscilloscope-axis-canvas" 
-                        class="bg-gray-950 rounded"
-                        width="50" 
-                        height="200"
-                    ></canvas>
-                    <!-- Waveform Canvas -->
-                    <canvas 
-                        id="oscilloscope-canvas" 
-                        class="flex-1 bg-gray-950 rounded"
-                        width="800" 
-                        height="200"
-                    ></canvas>
-                </div>
+                <canvas 
+                    id="oscilloscope-canvas" 
+                    class="bg-gray-950 rounded"
+                    width="800" 
+                    height="200"
+                ></canvas>
             </div>
         </main>
     </div>
 
     <script type="module" src="./main.js"></script>
     
+    <!-- Top Right Controls -->
+    <div class="fixed top-6 right-6 z-50 flex items-center gap-3">
+        <!-- Play/Pause Button -->
+        <button 
+            id="play-pause-btn" 
+            class="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-4 py-2 rounded transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500"
+        >
+            Play
+        </button>
+        
+        <!-- Settings Trigger Button -->
+        <button 
+            id="settings-trigger" 
+            class="w-12 h-12 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded-full shadow-lg flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500"
+            title="Settings"
+        >
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+        </button>
+    </div>
+
     <!-- Floating Settings Menu -->
-    <div id="settings-menu" class="fixed bottom-24 right-6 z-50 hidden">
+    <div id="settings-menu" class="fixed top-20 right-6 z-50 hidden">
         <div class="bg-gray-900/95 backdrop-blur-sm border border-gray-700 rounded-lg shadow-2xl p-4 min-w-[280px]">
-            <div class="flex flex-col gap-4">
-                <!-- Audio Source Dropdown -->
-                <div class="flex flex-col gap-2">
-                    <label for="audio-source" class="text-sm font-medium text-gray-300">
-                        Audio Source
-                    </label>
-                    <select 
-                        id="audio-source" 
-                        class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    >
-                        <option value="TEST AUDIO/D#m - 140BPM - Triple M v3.wav">
-                            D#m - 140BPM - Triple M v3 (WAV)
-                        </option>
-                        <option value="TEST AUDIO/D#m - 140BPM - Triple M v3.mp3">
-                            D#m - 140BPM - Triple M v3 (MP3)
-                        </option>
-                    </select>
+            <div class="flex flex-col divide-y divide-gray-700">
+                <!-- Input Section -->
+                <div class="flex flex-col gap-4 py-3">
+                    <!-- Audio Source Dropdown -->
+                    <div class="flex flex-col gap-2">
+                        <label for="audio-source" class="text-sm font-medium text-gray-300">
+                            Audio Source
+                        </label>
+                        <select 
+                            id="audio-source" 
+                            class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                            <option value="TEST AUDIO/D#m - 140BPM - Triple M v3.wav">
+                                D#m - 140BPM - Triple M v3 (WAV)
+                            </option>
+                            <option value="TEST AUDIO/D#m - 140BPM - Triple M v3.mp3">
+                                D#m - 140BPM - Triple M v3 (MP3)
+                            </option>
+                        </select>
+                    </div>
                 </div>
 
-                <!-- Play/Pause Button -->
-                <div class="flex flex-col gap-2">
-                    <button 
-                        id="play-pause-btn" 
-                        class="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-4 py-2 rounded transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 w-full"
-                    >
-                        Play
-                    </button>
+                <!-- Spectrogram Section -->
+                <div class="flex flex-col gap-4 py-3">
+                    <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Spectrogram</h3>
+                    
+                    <!-- Average Curve Response Slider -->
+                    <div class="flex flex-col gap-2">
+                        <label for="smoothing-slider" class="text-sm font-medium text-gray-300">
+                            Average Curve Response: <span id="smoothing-value">50</span>%
+                        </label>
+                        <input 
+                            type="range" 
+                            id="smoothing-slider" 
+                            min="0" 
+                            max="100" 
+                            value="50" 
+                            class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                        />
+                        <div class="text-xs text-gray-500 text-center">Fast <----> Slow</div>
+                    </div>
                 </div>
 
-                <!-- Smoothing Slider -->
-                <div class="flex flex-col gap-2">
-                    <label for="smoothing-slider" class="text-sm font-medium text-gray-300">
-                        Smoothing: <span id="smoothing-value">50</span>%
-                    </label>
-                    <input 
-                        type="range" 
-                        id="smoothing-slider" 
-                        min="0" 
-                        max="100" 
-                        value="50" 
-                        class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                    />
+                <!-- Analyzer Section -->
+                <div class="flex flex-col gap-4 py-3">
+                    <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Analyzer / Scope</h3>
+                    
+                    <!-- Peak Hold / Decay Slider -->
+                    <div class="flex flex-col gap-2">
+                        <label for="decay-speed-slider" class="text-sm font-medium text-gray-300">
+                            Peak Hold / Decay: <span id="decay-speed-value">1.00</span>x
+                        </label>
+                        <input 
+                            type="range" 
+                            id="decay-speed-slider" 
+                            min="0.25" 
+                            max="2.0" 
+                            step="0.05" 
+                            value="1.0" 
+                            class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                        />
+                        <div class="text-xs text-gray-500 text-center">Short <----> Long</div>
+                    </div>
+                    
+                    <!-- FFT Size Dropdown -->
+                    <div class="flex flex-col gap-2">
+                        <label for="fft-size-select" class="text-sm font-medium text-gray-300">
+                            FFT Size
+                        </label>
+                        <select 
+                            id="fft-size-select" 
+                            class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                            <option value="4096" selected>4096 (High Res)</option>
+                            <option value="2048">2048 (Standard)</option>
+                            <option value="1024">1024 (Fast)</option>
+                            <option value="512">512 (Ultra Fast)</option>
+                        </select>
+                    </div>
                 </div>
 
-                <!-- Decay Speed Slider -->
-                <div class="flex flex-col gap-2">
-                    <label for="decay-speed-slider" class="text-sm font-medium text-gray-300">
-                        Decay Speed: <span id="decay-speed-value">1.00</span>x
-                    </label>
-                    <input 
-                        type="range" 
-                        id="decay-speed-slider" 
-                        min="0.25" 
-                        max="2.0" 
-                        step="0.05" 
-                        value="1.0" 
-                        class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                    />
-                </div>
-
-                <!-- View Length Dropdown -->
-                <div class="flex flex-col gap-2">
-                    <label for="view-length" class="text-sm font-medium text-gray-300">
-                        View Length
-                    </label>
-                    <select 
-                        id="view-length" 
-                        class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    >
-                        <option value="1">1 Bar</option>
-                        <option value="4" selected>4 Bars</option>
-                        <option value="8">8 Bars</option>
-                    </select>
+                <!-- Oscilloscope Section -->
+                <div class="flex flex-col gap-4 py-3">
+                    <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Oscilloscope</h3>
+                    
+                    <!-- View Length Dropdown -->
+                    <div class="flex flex-col gap-2">
+                        <label for="view-length" class="text-sm font-medium text-gray-300">
+                            View Length
+                        </label>
+                        <select 
+                            id="view-length" 
+                            class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                            <option value="1">1 Bar</option>
+                            <option value="4" selected>4 Bars</option>
+                            <option value="8">8 Bars</option>
+                        </select>
+                    </div>
+                    
+                    <!-- Mono Sum Checkbox -->
+                    <div class="flex items-center gap-2">
+                        <input 
+                            type="checkbox" 
+                            id="mono-scope-check" 
+                            class="w-4 h-4 bg-gray-700 border-gray-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                        />
+                        <label for="mono-scope-check" class="text-sm font-medium text-gray-300 cursor-pointer">
+                            Mono Sum (Check Phase)
+                        </label>
+                    </div>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- Settings Trigger Button -->
-    <button 
-        id="settings-trigger" 
-        class="fixed bottom-6 right-6 z-50 w-12 h-12 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded-full shadow-lg flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500"
-        title="Settings"
-    >
-        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-        </svg>
-    </button>
-    
     <!-- Band Tooltip - Fixed position for guaranteed visibility -->
     <div
         id="bandTooltip"

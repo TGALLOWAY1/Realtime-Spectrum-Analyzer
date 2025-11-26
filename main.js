@@ -1,6 +1,38 @@
-// Audio context and analyser (shared across all sources)
+// Audio context and analysers (shared across all sources)
 let audioContext = null;
-let analyser = null;
+let analyserLeft = null; // For spectrum visualization
+let analyserRight = null; // For spectrum visualization
+let analyser = null; // Alias for analyserLeft (backward compatibility)
+let channelSplitter = null;
+
+// Crossover frequency constants (4-band crossover)
+const CROSSOVER_SUB_LOW = 120;
+const CROSSOVER_LOW_MID = 250;
+const CROSSOVER_MID_HIGH = 2500;
+
+// Multi-band crossover analysers (4 bands × 2 channels = 8 analysers)
+let analyserSubL = null;
+let analyserSubR = null;
+let analyserLowL = null;
+let analyserLowR = null;
+let analyserMidL = null;
+let analyserMidR = null;
+let analyserHighL = null;
+let analyserHighR = null;
+
+// Crossover filter nodes (4 bands × 2 channels = 8 primary filters + 4 intermediate filters = 12 total)
+let filterSubL = null;
+let filterSubR = null;
+let filterLowL = null;
+let filterLowR = null;
+let filterLowL_LP = null;  // Intermediate lowpass for Low band
+let filterLowR_LP = null;  // Intermediate lowpass for Low band
+let filterMidL = null;
+let filterMidR = null;
+let filterMidL_LP = null;  // Intermediate lowpass for Mid band
+let filterMidR_LP = null;  // Intermediate lowpass for Mid band
+let filterHighL = null;
+let filterHighR = null;
 
 // FFT data arrays
 let fftData = null;
@@ -39,6 +71,8 @@ const smoothingValue = document.getElementById('smoothing-value');
 const viewLengthSelect = document.getElementById('view-length');
 const decaySpeedSlider = document.getElementById('decay-speed-slider');
 const decaySpeedValue = document.getElementById('decay-speed-value');
+const fftSizeSelect = document.getElementById('fft-size-select');
+const monoScopeCheck = document.getElementById('mono-scope-check');
 
 // Hardcoded BPM
 const HARDCODED_BPM = 140;
@@ -46,14 +80,21 @@ const HARDCODED_BPM = 140;
 // Oscilloscope canvas setup
 const oscilloscopeCanvas = document.getElementById('oscilloscope-canvas');
 const oscilloscopeCtx = oscilloscopeCanvas ? oscilloscopeCanvas.getContext('2d') : null;
-const oscilloscopeContainer = oscilloscopeCanvas ? oscilloscopeCanvas.parentElement?.parentElement : null; // Parent is now the flex container
-
-// Oscilloscope axis canvas setup
-const oscilloscopeAxisCanvas = document.getElementById('oscilloscope-axis-canvas');
-const oscilloscopeAxisCtx = oscilloscopeAxisCanvas ? oscilloscopeAxisCanvas.getContext('2d') : null;
+const oscilloscopeContainer = oscilloscopeCanvas ? oscilloscopeCanvas.parentElement : null;
 
 // Oscilloscope state
-let timeDomainData = null; // Reusable Float32Array for time-domain data (allocated in initializeAudioContext)
+let timeDomainDataLeft = null; // Reusable Float32Array for left channel time-domain data (allocated in initializeAudioContext)
+let timeDomainDataRight = null; // Reusable Float32Array for right channel time-domain data (allocated in initializeAudioContext)
+
+// Multi-band time-domain data arrays (4 bands × 2 channels = 8 arrays)
+let timeDomainDataSubL = null;
+let timeDomainDataSubR = null;
+let timeDomainDataLowL = null;
+let timeDomainDataLowR = null;
+let timeDomainDataMidL = null;
+let timeDomainDataMidR = null;
+let timeDomainDataHighL = null;
+let timeDomainDataHighR = null;
 let waveformBuffer = []; // Circular buffer for storing raw waveform samples (no downsampling)
 let waveformColorBuffer = []; // Circular buffer for storing RGB color strings (parallel to waveformBuffer)
 let waveformBufferSize = 0; // Maximum buffer size (calculated based on view duration)
@@ -70,10 +111,17 @@ const FREQ_BAND_HIGHS_MIN = 2500; // 2.5 kHz
 const FREQ_BAND_HIGHS_MAX = 20000; // 20 kHz
 
 // Band Visualizer canvas setup
-const bandVisualizerCanvas = document.getElementById('band-visualizer-canvas');
-const bandVisualizerCtx = bandVisualizerCanvas ? bandVisualizerCanvas.getContext('2d') : null;
-const bandVisualizerContainer = bandVisualizerCanvas ? bandVisualizerCanvas.parentElement : null;
-const BAND_VISUALIZER_ASPECT_RATIO = 5.33; // 800x150 = 5.33:1
+// Multi-band vector scope canvases (4-band)
+const scopeSubCanvas = document.getElementById('scope-sub');
+const scopeSubCtx = scopeSubCanvas ? scopeSubCanvas.getContext('2d') : null;
+const scopeLowCanvas = document.getElementById('scope-low');
+const scopeLowCtx = scopeLowCanvas ? scopeLowCanvas.getContext('2d') : null;
+const scopeMidCanvas = document.getElementById('scope-mid');
+const scopeMidCtx = scopeMidCanvas ? scopeMidCanvas.getContext('2d') : null;
+const scopeHighCanvas = document.getElementById('scope-high');
+const scopeHighCtx = scopeHighCanvas ? scopeHighCanvas.getContext('2d') : null;
+const vectorScopeContainer = scopeSubCanvas ? scopeSubCanvas.parentElement?.parentElement : null;
+const VECTOR_SCOPE_ASPECT_RATIO = 1.2; // 300x250 = 1.2:1 (approximate)
 
 // Band Visualizer configuration
 const BAND_COUNT = 17;
@@ -119,12 +167,12 @@ let bandDefinitions = generateLogBands(BAND_COUNT, BAND_MIN_FREQ, BAND_MAX_FREQ)
  * Called after audio context is initialized
  */
 function computeBandBinIndices() {
-    if (!audioContext || !analyser || !frequencyBinCount) {
+    if (!audioContext || !analyserLeft || !frequencyBinCount) {
         return;
     }
     
     const sampleRate = audioContext.sampleRate;
-    const fftSize = analyser.fftSize;
+    const fftSize = analyserLeft.fftSize;
     const freqPerBin = sampleRate / fftSize;
     
     // Compute bin indices for each band
@@ -492,21 +540,69 @@ function initializeAudioContext() {
             console.log(`AudioContext created at browser default: ${audioContext.sampleRate} Hz`);
         }
         
-        analyser = audioContext.createAnalyser();
-        // Use high fftSize for detailed time-domain waveform (32768 = 16384 samples)
-        // This provides high resolution for capturing transients and high-frequency content
-        analyser.fftSize = 32768;
+        // Create left and right channel analysers (for spectrum visualization)
+        analyserLeft = audioContext.createAnalyser();
+        analyserRight = audioContext.createAnalyser();
+        
+        // Read initial FFT size from dropdown, or default to 4096
+        let initialFFTSize = 4096; // Default
+        if (fftSizeSelect && fftSizeSelect.value) {
+            initialFFTSize = parseInt(fftSizeSelect.value, 10);
+            if (!isFinite(initialFFTSize) || initialFFTSize < 32) {
+                console.warn('Invalid FFT size from dropdown, using default 4096');
+                initialFFTSize = 4096;
+            }
+        }
+        
+        // Set FFT size for spectrum visualization
+        analyserLeft.fftSize = initialFFTSize;
+        analyserRight.fftSize = initialFFTSize;
         
         // Calculate frequency bin count (fftSize / 2)
-        frequencyBinCount = analyser.frequencyBinCount;
+        frequencyBinCount = analyserLeft.frequencyBinCount;
         
-        // Allocate FFT data arrays
+        // Allocate FFT data arrays (using left channel for spectrum visualization)
         fftData = new Float32Array(frequencyBinCount);
         smoothedData = new Float32Array(frequencyBinCount); // Fast/Live data
         averageData = new Float32Array(frequencyBinCount);  // Long-term average data
         
-        // Allocate reusable time-domain data array (reused every frame to avoid allocations)
-        timeDomainData = new Float32Array(analyser.fftSize);
+        // Allocate reusable time-domain data arrays for both channels (reused every frame to avoid allocations)
+        timeDomainDataLeft = new Float32Array(analyserLeft.fftSize);
+        timeDomainDataRight = new Float32Array(analyserRight.fftSize);
+        
+        // Set analyser alias for backward compatibility
+        analyser = analyserLeft;
+        
+        // Create multi-band analysers (4 bands × 2 channels = 8 analysers)
+        analyserSubL = audioContext.createAnalyser();
+        analyserSubR = audioContext.createAnalyser();
+        analyserLowL = audioContext.createAnalyser();
+        analyserLowR = audioContext.createAnalyser();
+        analyserMidL = audioContext.createAnalyser();
+        analyserMidR = audioContext.createAnalyser();
+        analyserHighL = audioContext.createAnalyser();
+        analyserHighR = audioContext.createAnalyser();
+        
+        // Set fftSize for multi-band analysers (2048 or 4096 for good performance)
+        const multiBandFftSize = 4096;
+        analyserSubL.fftSize = multiBandFftSize;
+        analyserSubR.fftSize = multiBandFftSize;
+        analyserLowL.fftSize = multiBandFftSize;
+        analyserLowR.fftSize = multiBandFftSize;
+        analyserMidL.fftSize = multiBandFftSize;
+        analyserMidR.fftSize = multiBandFftSize;
+        analyserHighL.fftSize = multiBandFftSize;
+        analyserHighR.fftSize = multiBandFftSize;
+        
+        // Allocate reusable time-domain data arrays for multi-band analysers
+        timeDomainDataSubL = new Float32Array(analyserSubL.fftSize);
+        timeDomainDataSubR = new Float32Array(analyserSubR.fftSize);
+        timeDomainDataLowL = new Float32Array(analyserLowL.fftSize);
+        timeDomainDataLowR = new Float32Array(analyserLowR.fftSize);
+        timeDomainDataMidL = new Float32Array(analyserMidL.fftSize);
+        timeDomainDataMidR = new Float32Array(analyserMidR.fftSize);
+        timeDomainDataHighL = new Float32Array(analyserHighL.fftSize);
+        timeDomainDataHighR = new Float32Array(analyserHighR.fftSize);
         
         // Initialize smoothed data array (will be populated on first update)
         
@@ -516,7 +612,72 @@ function initializeAudioContext() {
         // Compute bin indices for each band
         computeBandBinIndices();
     }
-    return { audioContext, analyser };
+    return { 
+        audioContext, 
+        analyserLeft, 
+        analyserRight,
+        analyserSubL,
+        analyserSubR,
+        analyserLowL,
+        analyserLowR,
+        analyserMidL,
+        analyserMidR,
+        analyserHighL,
+        analyserHighR
+    };
+}
+
+/**
+ * Update FFT size for spectrum visualization
+ * Re-allocates all data arrays and resets state to prevent mismatches
+ * @param {number} newSize - New FFT size (must be power of 2, typically 512, 1024, 2048, 4096, etc.)
+ */
+function updateFFTSize(newSize) {
+    if (!analyserLeft || !analyserRight || !audioContext) {
+        console.warn('Cannot update FFT size: analysers not initialized');
+        return;
+    }
+    
+    // Validate FFT size (must be power of 2 and within valid range)
+    if (!isFinite(newSize) || newSize < 32 || newSize > 32768) {
+        console.warn(`Invalid FFT size: ${newSize}, must be between 32 and 32768`);
+        return;
+    }
+    
+    // Check if it's a power of 2
+    if ((newSize & (newSize - 1)) !== 0) {
+        console.warn(`FFT size ${newSize} is not a power of 2, rounding may occur`);
+    }
+    
+    console.log(`Updating FFT size from ${analyserLeft.fftSize} to ${newSize}`);
+    
+    // Update analyser FFT sizes
+    analyserLeft.fftSize = newSize;
+    analyserRight.fftSize = newSize;
+    
+    // Update analyser alias for backward compatibility
+    analyser = analyserLeft;
+    
+    // Update global frequency bin count
+    frequencyBinCount = analyserLeft.frequencyBinCount;
+    
+    // Re-allocate FFT data arrays with new lengths
+    fftData = new Float32Array(frequencyBinCount);
+    smoothedData = new Float32Array(frequencyBinCount); // Fast/Live data
+    averageData = new Float32Array(frequencyBinCount);  // Long-term average data
+    
+    // Re-allocate time-domain data arrays
+    timeDomainDataLeft = new Float32Array(analyserLeft.fftSize);
+    timeDomainDataRight = new Float32Array(analyserRight.fftSize);
+    
+    // Re-compute band bin indices for the new FFT size
+    computeBandBinIndices();
+    
+    // Reset state flags to prevent data mismatches
+    emaInitialized = false;
+    averageDataInitialized = false;
+    
+    console.log(`FFT size updated successfully. New frequencyBinCount: ${frequencyBinCount}`);
 }
 
 /**
@@ -528,7 +689,19 @@ function setupTestAudio(audioPath) {
     cleanupTestAudio();
     
     // Initialize audio context if needed
-    const { audioContext: ctx, analyser: anal } = initializeAudioContext();
+            const {
+                audioContext: ctx,
+                analyserLeft: analLeft,
+                analyserRight: analRight,
+                analyserSubL: analSubL,
+                analyserSubR: analSubR,
+                analyserLowL: analLowL,
+                analyserLowR: analLowR,
+                analyserMidL: analMidL,
+                analyserMidR: analMidR,
+                analyserHighL: analHighL,
+                analyserHighR: analHighR
+            } = initializeAudioContext();
     
     // Create audio element
     const audioElement = document.createElement('audio');
@@ -620,27 +793,155 @@ function setupTestAudio(audioPath) {
             // Create MediaElementAudioSourceNode
             const audioSource = ctx.createMediaElementSource(audioElement);
             
+            // Create ChannelSplitterNode to split stereo channels
+            channelSplitter = ctx.createChannelSplitter(2);
+            
             // IMPORTANT: When using MediaElementAudioSourceNode, the audio element
             // should NOT be connected to its default destination. The source node
-            // handles the connection. Connect: audio source → analyser → destination
-            audioSource.connect(anal);
-            anal.connect(ctx.destination);
+            // handles the connection.
+            // Connect: audio source → splitter
+            audioSource.connect(channelSplitter);
+            
+            // ===== CREATE 4-BAND CROSSOVER FILTERS =====
+            // Left channel filters
+            
+            // Sub Band: Lowpass @ CROSSOVER_SUB_LOW (120Hz)
+            filterSubL = ctx.createBiquadFilter();
+            filterSubL.type = 'lowpass';
+            filterSubL.frequency.value = CROSSOVER_SUB_LOW;
+            
+            // Low Band: Highpass @ CROSSOVER_SUB_LOW -> Lowpass @ CROSSOVER_LOW_MID
+            filterLowL = ctx.createBiquadFilter();
+            filterLowL.type = 'highpass';
+            filterLowL.frequency.value = CROSSOVER_SUB_LOW;
+            filterLowL_LP = ctx.createBiquadFilter();
+            filterLowL_LP.type = 'lowpass';
+            filterLowL_LP.frequency.value = CROSSOVER_LOW_MID;
+            filterLowL.connect(filterLowL_LP);
+            
+            // Mid Band: Highpass @ CROSSOVER_LOW_MID -> Lowpass @ CROSSOVER_MID_HIGH
+            filterMidL = ctx.createBiquadFilter();
+            filterMidL.type = 'highpass';
+            filterMidL.frequency.value = CROSSOVER_LOW_MID;
+            filterMidL_LP = ctx.createBiquadFilter();
+            filterMidL_LP.type = 'lowpass';
+            filterMidL_LP.frequency.value = CROSSOVER_MID_HIGH;
+            filterMidL.connect(filterMidL_LP);
+            
+            // High Band: Highpass @ CROSSOVER_MID_HIGH (2500Hz)
+            filterHighL = ctx.createBiquadFilter();
+            filterHighL.type = 'highpass';
+            filterHighL.frequency.value = CROSSOVER_MID_HIGH;
+            
+            // Right channel filters (same structure as left)
+            
+            // Sub Band: Lowpass @ CROSSOVER_SUB_LOW (120Hz)
+            filterSubR = ctx.createBiquadFilter();
+            filterSubR.type = 'lowpass';
+            filterSubR.frequency.value = CROSSOVER_SUB_LOW;
+            
+            // Low Band: Highpass @ CROSSOVER_SUB_LOW -> Lowpass @ CROSSOVER_LOW_MID
+            filterLowR = ctx.createBiquadFilter();
+            filterLowR.type = 'highpass';
+            filterLowR.frequency.value = CROSSOVER_SUB_LOW;
+            filterLowR_LP = ctx.createBiquadFilter();
+            filterLowR_LP.type = 'lowpass';
+            filterLowR_LP.frequency.value = CROSSOVER_LOW_MID;
+            filterLowR.connect(filterLowR_LP);
+            
+            // Mid Band: Highpass @ CROSSOVER_LOW_MID -> Lowpass @ CROSSOVER_MID_HIGH
+            filterMidR = ctx.createBiquadFilter();
+            filterMidR.type = 'highpass';
+            filterMidR.frequency.value = CROSSOVER_LOW_MID;
+            filterMidR_LP = ctx.createBiquadFilter();
+            filterMidR_LP.type = 'lowpass';
+            filterMidR_LP.frequency.value = CROSSOVER_MID_HIGH;
+            filterMidR.connect(filterMidR_LP);
+            
+            // High Band: Highpass @ CROSSOVER_MID_HIGH (2500Hz)
+            filterHighR = ctx.createBiquadFilter();
+            filterHighR.type = 'highpass';
+            filterHighR.frequency.value = CROSSOVER_MID_HIGH;
+            
+            // ===== CONNECT SPLITTER TO FILTERS =====
+            // Left channel (output 0) → filters
+            channelSplitter.connect(filterSubL, 0);
+            channelSplitter.connect(filterLowL, 0);
+            channelSplitter.connect(filterMidL, 0);
+            channelSplitter.connect(filterHighL, 0);
+            
+            // Right channel (output 1) → filters
+            channelSplitter.connect(filterSubR, 1);
+            channelSplitter.connect(filterLowR, 1);
+            channelSplitter.connect(filterMidR, 1);
+            channelSplitter.connect(filterHighR, 1);
+            
+            // ===== CONNECT FILTERS TO ANALYSERS =====
+            // Left channel filters → analysers
+            filterSubL.connect(analSubL);
+            filterLowL_LP.connect(analLowL);  // Connect the lowpass stage of Low band
+            filterMidL_LP.connect(analMidL);  // Connect the lowpass stage of Mid band
+            filterHighL.connect(analHighL);
+            
+            // Right channel filters → analysers
+            filterSubR.connect(analSubR);
+            filterLowR_LP.connect(analLowR);  // Connect the lowpass stage of Low band
+            filterMidR_LP.connect(analMidR);  // Connect the lowpass stage of Mid band
+            filterHighR.connect(analHighR);
+            
+            // ===== CONNECT TO SPECTRUM ANALYSERS =====
+            // Also connect splitter outputs to analyserLeft/analyserRight for spectrum visualization
+            channelSplitter.connect(analLeft, 0);
+            channelSplitter.connect(analRight, 1);
+            
+            // ===== CONNECT TO AUDIO OUTPUT =====
+            // Connect source to destination for audio playback (maintains full stereo output)
+            audioSource.connect(ctx.destination);
             
             // Verify connection
             console.log('Audio node connections:', {
                 sourceConnected: audioSource.numberOfOutputs > 0,
-                analyserConnected: anal.numberOfInputs > 0 && anal.numberOfOutputs > 0,
+                splitterCreated: !!channelSplitter,
+                filtersCreated: {
+                    left: { sub: !!filterSubL, low: !!filterLowL, mid: !!filterMidL, high: !!filterHighL },
+                    right: { sub: !!filterSubR, low: !!filterLowR, mid: !!filterMidR, high: !!filterHighR }
+                },
+                analyserLeftConnected: analLeft.numberOfInputs > 0 && analLeft.numberOfOutputs > 0,
+                analyserRightConnected: analRight.numberOfInputs > 0 && analRight.numberOfOutputs > 0,
+                multiBandAnalysersConnected: {
+                    subL: analSubL.numberOfInputs > 0,
+                    subR: analSubR.numberOfInputs > 0,
+                    lowL: analLowL.numberOfInputs > 0,
+                    lowR: analLowR.numberOfInputs > 0,
+                    midL: analMidL.numberOfInputs > 0,
+                    midR: analMidR.numberOfInputs > 0,
+                    highL: analHighL.numberOfInputs > 0,
+                    highR: analHighR.numberOfInputs > 0
+                },
                 destinationConnected: ctx.destination.numberOfInputs > 0
             });
             
             // Store reference
             currentAudioSource = audioSource;
             
-            console.log('Audio source node created successfully', {
-                analyserFftSize: anal.fftSize,
-                frequencyBinCount: anal.frequencyBinCount,
+            console.log('Audio source node created successfully with 4-band crossover routing', {
+                analyserLeftFftSize: analLeft.fftSize,
+                analyserRightFftSize: analRight.fftSize,
+                multiBandFftSize: analSubL.fftSize,
+                frequencyBinCount: analLeft.frequencyBinCount,
                 sampleRate: ctx.sampleRate,
-                audioContextState: ctx.state
+                audioContextState: ctx.state,
+                crossoverFrequencies: {
+                    subLow: CROSSOVER_SUB_LOW,
+                    lowMid: CROSSOVER_LOW_MID,
+                    midHigh: CROSSOVER_MID_HIGH
+                },
+                bandRanges: {
+                    sub: `0-${CROSSOVER_SUB_LOW}Hz`,
+                    low: `${CROSSOVER_SUB_LOW}-${CROSSOVER_LOW_MID}Hz`,
+                    mid: `${CROSSOVER_LOW_MID}-${CROSSOVER_MID_HIGH}Hz`,
+                    high: `${CROSSOVER_MID_HIGH}Hz+`
+                }
             });
             
             // Verify FFT arrays are initialized
@@ -773,6 +1074,47 @@ function cleanupTestAudio() {
         currentAudioElement = null;
         currentAudioSource = null;
     }
+    
+    // Disconnect and reset channel splitter reference
+    if (channelSplitter) {
+        try {
+            channelSplitter.disconnect();
+        } catch (e) {
+            // Ignore disconnect errors (node may already be disconnected)
+        }
+        channelSplitter = null;
+    }
+    
+    // Disconnect and reset crossover filter references
+    const filters = [
+        filterSubL, filterSubR,
+        filterLowL, filterLowR, filterLowL_LP, filterLowR_LP,
+        filterMidL, filterMidR, filterMidL_LP, filterMidR_LP,
+        filterHighL, filterHighR
+    ];
+    filters.forEach(filter => {
+        if (filter) {
+            try {
+                filter.disconnect();
+            } catch (e) {
+                // Ignore disconnect errors
+            }
+        }
+    });
+    
+    // Reset filter references
+    filterSubL = null;
+    filterSubR = null;
+    filterLowL = null;
+    filterLowR = null;
+    filterLowL_LP = null;
+    filterLowR_LP = null;
+    filterMidL = null;
+    filterMidR = null;
+    filterMidL_LP = null;
+    filterMidR_LP = null;
+    filterHighL = null;
+    filterHighR = null;
 }
 
 /**
@@ -834,7 +1176,7 @@ function calculateViewDuration(bpm, bars) {
  * Calculates how many samples are needed to store the requested time duration
  */
 function updateWaveformBufferSize() {
-    if (!analyser || !audioContext) return;
+    if (!analyserLeft || !audioContext) return;
     
     const bpm = HARDCODED_BPM;
     const bars = parseInt(viewLengthSelect.value) || 4;
@@ -941,34 +1283,37 @@ function calculateFrequencyColor(fftData, fftSize) {
     // Total energy for normalization
     const totalEnergy = lowsAvg + midsAvg + highsAvg;
     
-    // Normalize and convert to RGB (0-255)
-    // Lows -> Red channel, Mids -> Green channel, Highs -> Blue channel
-    let r = 0, g = 0, b = 0;
+    // Normalize band energies (0.0 to 1.0)
+    let lowsNorm = 0, midsNorm = 0, highsNorm = 0;
     
     if (totalEnergy > 0) {
-        const lowsNorm = lowsAvg / totalEnergy;
-        const midsNorm = midsAvg / totalEnergy;
-        const highsNorm = highsAvg / totalEnergy;
-        
-        // Map normalized energy to RGB (0-255)
-        // Use square root for better visual distribution
-        r = Math.floor(Math.sqrt(lowsNorm) * 255);
-        g = Math.floor(Math.sqrt(midsNorm) * 255);
-        b = Math.floor(Math.sqrt(highsNorm) * 255);
-    } else {
-        // Silence - use gray
-        r = g = b = 128;
+        lowsNorm = lowsAvg / totalEnergy;
+        midsNorm = midsAvg / totalEnergy;
+        highsNorm = highsAvg / totalEnergy;
     }
     
-    // Ensure minimum brightness for visibility
-    const minBrightness = 30;
-    if (r < minBrightness && g < minBrightness && b < minBrightness) {
-        r = Math.max(minBrightness, r);
-        g = Math.max(minBrightness, g);
-        b = Math.max(minBrightness, b);
-    }
+    // Map to Cool Color Palette (Blues, Cyans, Whites)
+    // Formula:
+    // R = highsNorm * 255  (Highs -> Red channel: High Treble + Cyan + Blue = White)
+    // G = midsNorm * 255   (Mids -> Green channel: High Mids -> Cyan)
+    // B = 150 + (lowsNorm * 105)  (Base Blue 150 + Lows contribution: Bass-heavy -> Deep Blue)
     
-    return `rgb(${r}, ${g}, ${b})`;
+    // Clamp normalized values to [0, 1] for safety
+    lowsNorm = Math.max(0, Math.min(1, lowsNorm));
+    midsNorm = Math.max(0, Math.min(1, midsNorm));
+    highsNorm = Math.max(0, Math.min(1, highsNorm));
+    
+    // Calculate RGB values
+    const r = Math.floor(highsNorm * 255);
+    const g = Math.floor(midsNorm * 255);
+    const b = Math.floor(150 + (lowsNorm * 105)); // Base blue of 150, plus lows up to 255
+    
+    // Clamp RGB values to valid range [0, 255]
+    const clampedR = Math.max(0, Math.min(255, r));
+    const clampedG = Math.max(0, Math.min(255, g));
+    const clampedB = Math.max(0, Math.min(255, b));
+    
+    return `rgb(${clampedR}, ${clampedG}, ${clampedB})`;
 }
 
 /**
@@ -987,31 +1332,194 @@ function getBufferColor(index) {
 
 /**
  * Update waveform buffer with new time-domain data and calculate colors from frequency data
- * Calculates color based on current FFT data for frequency content representation
+ * Supports mono sum mode for phase cancellation visualization
  */
 function updateWaveform() {
-    if (!analyser || !timeDomainData || waveformBufferSize === 0 || !fftData) return;
+    if (!analyserLeft || !analyserRight || !timeDomainDataLeft || !timeDomainDataRight || waveformBufferSize === 0 || !fftData) return;
     
-    // Get time-domain data (raw audio samples) - reuse the same array
-    analyser.getFloatTimeDomainData(timeDomainData);
+    // Get time-domain data for both channels (raw audio samples) - reuse the same arrays
+    analyserLeft.getFloatTimeDomainData(timeDomainDataLeft);
+    analyserRight.getFloatTimeDomainData(timeDomainDataRight);
     
-    // Get current frequency data for color calculation
-    analyser.getFloatFrequencyData(fftData);
-    
-    // Calculate color based on current frequency content
-    const color = calculateFrequencyColor(fftData, analyser.fftSize);
+    // Read checkbox state for mono sum mode
+    const useMonoSum = monoScopeCheck && monoScopeCheck.checked;
     
     // Estimate: at 60fps, we get ~800 new samples per frame at 48kHz
     // Add samples from the last portion of time-domain data
-    const samplesToAdd = Math.min(1024, timeDomainData.length);
-    const startIdx = Math.max(0, timeDomainData.length - samplesToAdd);
+    const samplesToAdd = Math.min(1024, timeDomainDataLeft.length);
+    const startIdx = Math.max(0, timeDomainDataLeft.length - samplesToAdd);
     
-    // Add samples and colors to circular buffers
-    for (let i = startIdx; i < timeDomainData.length; i++) {
-        waveformBuffer[waveformWriteIndex] = timeDomainData[i];
-        waveformColorBuffer[waveformWriteIndex] = color; // Same color for all samples in this frame
+    // Iterate through new samples and add to circular buffer
+    for (let i = startIdx; i < timeDomainDataLeft.length; i++) {
+        let sample;
+        
+        if (useMonoSum) {
+            // Mono Mode: Calculate mono sum (left + right) / 2
+            // This helps visualize phase cancellation:
+            // If mono sum is quieter than individual channels, there's phase cancellation
+            const left = timeDomainDataLeft[i];
+            const right = timeDomainDataRight[i];
+            
+            if (isFinite(left) && isFinite(right)) {
+                sample = (left + right) / 2;
+            } else if (isFinite(left)) {
+                sample = left;
+            } else if (isFinite(right)) {
+                sample = right;
+            } else {
+                sample = 0; // Both invalid, use zero
+            }
+        } else {
+            // Normal Mode: Use left channel only
+            sample = timeDomainDataLeft[i];
+        }
+        
+        // Push calculated sample into waveform buffer
+        // Color is now calculated dynamically in drawOscilloscope based on amplitude
+        waveformBuffer[waveformWriteIndex] = sample;
         waveformWriteIndex = (waveformWriteIndex + 1) % waveformBufferSize;
     }
+}
+
+/**
+ * Calculate Pearson correlation coefficient between two audio buffers
+ * Measures phase correlation: -1 (180° out of phase) to +1 (perfect mono)
+ * @param {Float32Array} leftBuffer - Left channel time-domain data
+ * @param {Float32Array} rightBuffer - Right channel time-domain data
+ * @returns {number} Correlation coefficient (-1 to +1)
+ */
+function calculateCorrelation(leftBuffer, rightBuffer) {
+    if (!leftBuffer || !rightBuffer || leftBuffer.length === 0 || rightBuffer.length === 0) {
+        return 0;
+    }
+    
+    const minLength = Math.min(leftBuffer.length, rightBuffer.length);
+    if (minLength === 0) {
+        return 0;
+    }
+    
+    // Calculate sums for Pearson correlation coefficient
+    let sumLR = 0;  // Sum of (L[i] * R[i])
+    let sumL2 = 0;  // Sum of (L[i]^2)
+    let sumR2 = 0;  // Sum of (R[i]^2)
+    
+    for (let i = 0; i < minLength; i++) {
+        const left = leftBuffer[i];
+        const right = rightBuffer[i];
+        
+        // Skip invalid samples
+        if (!isFinite(left) || !isFinite(right)) {
+            continue;
+        }
+        
+        sumLR += left * right;
+        sumL2 += left * left;
+        sumR2 += right * right;
+    }
+    
+    // Calculate denominator: sqrt(Sum(L[i]^2)) * sqrt(Sum(R[i]^2))
+    const denominator = Math.sqrt(sumL2) * Math.sqrt(sumR2);
+    
+    // Avoid division by zero
+    if (denominator === 0 || !isFinite(denominator)) {
+        return 0;
+    }
+    
+    // Pearson correlation coefficient: Sum(L[i] * R[i]) / (sqrt(Sum(L[i]^2)) * sqrt(Sum(R[i]^2)))
+    const correlation = sumLR / denominator;
+    
+    // Clamp to valid range [-1, 1]
+    return Math.max(-1, Math.min(1, correlation));
+}
+
+/**
+ * Get phase correlation color and glow style based on correlation value and band type
+ * @param {number} correlation - Correlation coefficient (-1 to +1)
+ * @param {string} bandType - Band type: 'low', 'mid', or 'high'
+ * @returns {Object} Object with `color` (CSS color string) and `glow` (CSS box-shadow string)
+ */
+function getPhaseColor(correlation, bandType) {
+    if (!isFinite(correlation)) {
+        return { color: '#6b7280', glow: '0 0 0px rgba(107, 114, 128, 0)' }; // gray-500, no glow
+    }
+    
+    let color;
+    let glowColor;
+    let glowIntensity;
+    
+    // Define thresholds and colors based on band type
+    if (bandType === 'sub') {
+        // Sub band: Green if > 0.95, Yellow > 0.8, else Red
+        // Sub frequencies are typically very mono, so use stricter thresholds
+        if (correlation > 0.95) {
+            color = '#22c55e'; // green-500
+            glowColor = 'rgba(34, 197, 94, 0.8)'; // green-500 with alpha
+            glowIntensity = 8;
+        } else if (correlation > 0.8) {
+            color = '#eab308'; // yellow-500
+            glowColor = 'rgba(234, 179, 8, 0.6)'; // yellow-500 with alpha
+            glowIntensity = 6;
+        } else {
+            color = '#ef4444'; // red-500
+            glowColor = 'rgba(239, 68, 68, 0.4)'; // red-500 with alpha
+            glowIntensity = 4;
+        }
+    } else if (bandType === 'low') {
+        // Low band: Green if > 0.9, Yellow > 0.7, else Red
+        if (correlation > 0.9) {
+            color = '#22c55e'; // green-500
+            glowColor = 'rgba(34, 197, 94, 0.8)'; // green-500 with alpha
+            glowIntensity = 8;
+        } else if (correlation > 0.7) {
+            color = '#eab308'; // yellow-500
+            glowColor = 'rgba(234, 179, 8, 0.6)'; // yellow-500 with alpha
+            glowIntensity = 6;
+        } else {
+            color = '#ef4444'; // red-500
+            glowColor = 'rgba(239, 68, 68, 0.4)'; // red-500 with alpha
+            glowIntensity = 4;
+        }
+    } else if (bandType === 'mid') {
+        // Mid band: Green if > 0.5, Yellow > 0.0, else Red
+        if (correlation > 0.5) {
+            color = '#22c55e'; // green-500
+            glowColor = 'rgba(34, 197, 94, 0.8)'; // green-500 with alpha
+            glowIntensity = 8;
+        } else if (correlation > 0.0) {
+            color = '#eab308'; // yellow-500
+            glowColor = 'rgba(234, 179, 8, 0.6)'; // yellow-500 with alpha
+            glowIntensity = 6;
+        } else {
+            color = '#ef4444'; // red-500
+            glowColor = 'rgba(239, 68, 68, 0.4)'; // red-500 with alpha
+            glowIntensity = 4;
+        }
+    } else if (bandType === 'high') {
+        // High band: Green if > 0.0, Yellow > -0.5, else Red
+        if (correlation > 0.0) {
+            color = '#22c55e'; // green-500
+            glowColor = 'rgba(34, 197, 94, 0.8)'; // green-500 with alpha
+            glowIntensity = 8;
+        } else if (correlation > -0.5) {
+            color = '#eab308'; // yellow-500
+            glowColor = 'rgba(234, 179, 8, 0.6)'; // yellow-500 with alpha
+            glowIntensity = 6;
+        } else {
+            color = '#ef4444'; // red-500
+            glowColor = 'rgba(239, 68, 68, 0.4)'; // red-500 with alpha
+            glowIntensity = 4;
+        }
+    } else {
+        // Default fallback
+        color = '#6b7280'; // gray-500
+        glowColor = 'rgba(107, 114, 128, 0)'; // gray-500, no glow
+        glowIntensity = 0;
+    }
+    
+    // Create glow style string (box-shadow)
+    const glow = `0 0 ${glowIntensity}px ${glowColor}`;
+    
+    return { color, glow };
 }
 
 /**
@@ -1187,17 +1695,30 @@ function getBufferSample(index) {
  * Draws vertical lines/rectangles with colors representing frequency content
  * Shows most recent data on the right, older data on the left
  * @param {CanvasRenderingContext2D} ctx - Canvas rendering context
- * @param {AnalyserNode} analyser - Web Audio AnalyserNode
+ * @param {AnalyserNode} analyser - Web Audio AnalyserNode (left channel for waveform display)
  * @param {number} canvasWidth - Canvas width in CSS pixels
  * @param {number} canvasHeight - Canvas height in CSS pixels
  */
 function drawOscilloscope(ctx, analyser, canvasWidth, canvasHeight) {
-    if (!ctx || !analyser || waveformBuffer.length === 0 || waveformColorBuffer.length === 0) {
+    if (!ctx || !analyser || waveformBuffer.length === 0) {
         return;
     }
     
-    const centerY = canvasHeight / 2;
-    const waveformHeight = canvasHeight * 0.4; // 80% of height for waveform (40% above and below center)
+    // Calculate active draw area using same margins as spectrum
+    const activeLeft = MARGIN_LEFT;
+    const activeTop = MARGIN_TOP;
+    const activeRight = canvasWidth - MARGIN_RIGHT;
+    const activeBottom = canvasHeight - MARGIN_BOTTOM;
+    const activeWidth = activeRight - activeLeft;
+    const activeHeight = activeBottom - activeTop;
+    
+    // Map amplitude range (-1.0 to +1.0) to active area (activeBottom to activeTop)
+    // +1.0 maps to activeTop (top of active area)
+    // -1.0 maps to activeBottom (bottom of active area)
+    // 0.0 maps to center
+    const centerY = activeTop + activeHeight / 2;
+    const amplitudeRange = activeHeight / 2; // Half the active height represents amplitude range from 0 to ±1.0
+    
     const bufferLength = waveformBuffer.length;
     
     // Calculate how many samples to show based on view duration
@@ -1213,52 +1734,122 @@ function drawOscilloscope(ctx, analyser, canvasWidth, canvasHeight) {
     const newestBufferIdx = waveformWriteIndex - 1;
     const oldestBufferIdx = waveformWriteIndex - samplesToShow;
     
-    // Clear canvas
+    // Clear entire canvas
     ctx.fillStyle = '#030712'; // gray-950
     ctx.fillRect(0, 0, canvasWidth, canvasHeight);
     
-    // Draw zero-crossing line
-    ctx.strokeStyle = 'rgba(107, 114, 128, 0.3)'; // gray-500 with transparency
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, centerY);
-    ctx.lineTo(canvasWidth, centerY);
-    ctx.stroke();
+    // ===== DRAW Y-AXIS LABELS AND GRID (Linear Amplitude Scale) =====
+    ctx.save();
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
     
-    // Draw waveform as vertical lines/rectangles with frequency-based colors
-    // Most recent data appears on the right, older data scrolls left
-    // x=0 (leftmost) = oldest visible data, x=canvasWidth-1 (rightmost) = newest data
+    // Linear amplitude markers: +1.0 (top), +0.5, 0.0 (center), -0.5, -1.0 (bottom)
+    const amplitudeMarkers = [
+        { label: '+1.0', amplitude: 1.0 },
+        { label: '+0.5', amplitude: 0.5 },
+        { label: ' 0.0', amplitude: 0.0 },  // Center line (will be brighter)
+        { label: '-0.5', amplitude: -0.5 },
+        { label: '-1.0', amplitude: -1.0 },
+    ];
     
-    for (let x = 0; x < canvasWidth; x++) {
-        // Map canvas X to buffer index range
-        const normalizedX = canvasWidth > 1 ? x / (canvasWidth - 1) : 0;
-        const bufferIdx = oldestBufferIdx + normalizedX * (newestBufferIdx - oldestBufferIdx);
+    for (const marker of amplitudeMarkers) {
+        // Map amplitude (-1.0 to +1.0) to Y coordinate (activeBottom to activeTop)
+        // +1.0 -> activeTop, -1.0 -> activeBottom, 0.0 -> centerY
+        const y = centerY - (marker.amplitude * amplitudeRange);
+        const clampedY = Math.max(activeTop, Math.min(activeBottom, y));
         
-        // Get sample and color from buffer (use nearest sample for color accuracy)
-        const i0 = Math.floor(bufferIdx);
-        const sample = getBufferSample(i0);
-        const color = getBufferColor(i0);
-        
-        // Convert sample (-1 to 1) to Y coordinate
-        // Positive amplitude goes up, negative goes down (symmetric waveform)
-        const amplitude = Math.max(-1, Math.min(1, sample));
-        const yOffset = amplitude * waveformHeight;
-        const yTop = centerY - yOffset;
-        const yBottom = centerY + yOffset;
-        
-        // Draw vertical line/rectangle for this pixel column
-        // Use the color from the buffer
-        ctx.fillStyle = color;
-        ctx.strokeStyle = color;
+        // Draw horizontal grid line across active area
+        // Center line (0.0) is slightly brighter
+        if (marker.amplitude === 0.0) {
+            ctx.strokeStyle = 'rgba(75, 85, 99, 0.5)'; // Slightly brighter for center line
+        } else {
+            ctx.strokeStyle = 'rgba(75, 85, 99, 0.3)'; // gray-600 with transparency
+        }
         ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(activeLeft, clampedY);
+        ctx.lineTo(Math.min(activeRight, canvasWidth - 1), clampedY); // Ensure line doesn't extend past canvas
+        ctx.stroke();
         
-        // Draw as a filled vertical rectangle (symmetric around center)
-        // For very small amplitudes, draw at least a 1px line
-        const lineHeight = Math.max(1, Math.abs(yBottom - yTop));
-        const drawY = Math.min(yTop, yBottom);
-        
-        ctx.fillRect(x, drawY, 1, lineHeight);
+        // Draw label in left margin
+        ctx.fillStyle = '#9ca3af'; // gray-400
+        const labelX = 8; // Position in left margin
+        ctx.fillText(marker.label, labelX, clampedY);
     }
+    
+    ctx.restore();
+    
+    // ===== DRAW WAVEFORM IN ACTIVE AREA =====
+    // Save context and clip to active area
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(activeLeft, activeTop, activeWidth, activeHeight);
+    ctx.clip();
+    
+    // Draw waveform using Peak Sampling (scan all samples in pixel's time window)
+    // Most recent data appears on the right, older data scrolls left
+    // x=activeLeft (leftmost) = oldest visible data, x=activeRight-1 (rightmost) = newest data
+    
+    // Calculate samples per pixel for peak sampling
+    const samplesPerPixel = samplesToShow / activeWidth;
+    
+    // Iterate through each pixel column in the active area
+    for (let x = activeLeft; x < activeRight; x++) {
+        // Calculate the normalized position (0.0 to 1.0) within the active area
+        const normalizedX = activeWidth > 1 ? (x - activeLeft) / (activeWidth - 1) : 0;
+        
+        // Calculate the buffer index range for this pixel's time slice
+        const centerBufferIdx = oldestBufferIdx + normalizedX * (newestBufferIdx - oldestBufferIdx);
+        const startBufferIndex = Math.floor(centerBufferIdx - samplesPerPixel / 2);
+        const endBufferIndex = Math.ceil(centerBufferIdx + samplesPerPixel / 2);
+        
+        // Find the peak (maximum absolute amplitude) in this pixel's time slice
+        let maxAmplitude = 0;
+        
+        for (let bufferIdx = startBufferIndex; bufferIdx <= endBufferIndex; bufferIdx++) {
+            const sample = getBufferSample(bufferIdx);
+            
+            // Calculate amplitude (absolute value)
+            const amplitude = Math.abs(sample);
+            
+            // Track the peak
+            if (amplitude > maxAmplitude) {
+                maxAmplitude = amplitude;
+            }
+        }
+        
+        // Clamp maxAmplitude to valid range [0, 1]
+        maxAmplitude = Math.max(0, Math.min(1, maxAmplitude));
+        
+        // Calculate amplitude-based color (matches Spectrogram's gradient style)
+        // Normalized amplitude (0.0 to 1.0)
+        const normalized = maxAmplitude;
+        
+        // Dynamic HSLA coloring:
+        // Hue: shifts from Blue (210) to Cyan (190) as amplitude increases
+        const hue = 210 - (normalized * 20);
+        
+        // Lightness: shifts from Dark (20) to Bright White (90) as amplitude increases
+        const lightness = 20 + (normalized * 70);
+        
+        // Alpha: shifts from Transparent (0.6) to Opaque (1.0) as amplitude increases
+        const alpha = 0.6 + (normalized * 0.4);
+        
+        // Create HSLA color string
+        const color = `hsla(${hue}, 100%, ${lightness}%, ${alpha})`;
+        
+        // Calculate bar height based on peak amplitude
+        const barHeight = maxAmplitude * amplitudeRange;
+        
+        // Draw symmetric vertical bar centered at centerY with amplitude-based color
+        // This creates a solid "envelope" that looks much cleaner than a thin line
+        ctx.fillStyle = color;
+        ctx.fillRect(x, centerY - barHeight, 1, barHeight * 2);
+    }
+    
+    // Restore context (removes clipping)
+    ctx.restore();
 }
 
 /**
@@ -1283,7 +1874,7 @@ function drawOscilloscopeWrapper() {
         cssHeight = parseFloat(oscilloscopeCanvas.style.height);
     }
     
-    drawOscilloscope(oscilloscopeCtx, analyser, cssWidth, cssHeight);
+    drawOscilloscope(oscilloscopeCtx, analyserLeft, cssWidth, cssHeight);
 }
 
 /**
@@ -1292,22 +1883,23 @@ function drawOscilloscopeWrapper() {
 function resizeOscilloscopeCanvas() {
     if (!oscilloscopeCanvas || !oscilloscopeContainer) return;
     
+    // Get container dimensions (clientWidth/clientHeight already account for padding)
     const containerWidth = oscilloscopeContainer.clientWidth;
     const containerHeight = oscilloscopeContainer.clientHeight;
     
-    // Fixed width for axis canvas (50px to accommodate labels)
-    const axisWidth = 50;
-    
-    // Calculate waveform canvas CSS dimensions
-    // Account for axis width and gap (gap-2 in Tailwind = 0.5rem = 8px)
-    const availableWidth = containerWidth - axisWidth - 8; // 8px gap
-    let cssWidth = availableWidth;
-    let cssHeight = availableWidth / OSCILLOSCOPE_ASPECT_RATIO;
+    // Calculate canvas CSS dimensions (single canvas fills container, accounting for padding)
+    // The container has p-4 padding (16px on each side), so clientWidth already accounts for this
+    let cssWidth = containerWidth;
+    let cssHeight = containerWidth / OSCILLOSCOPE_ASPECT_RATIO;
     
     if (cssHeight > containerHeight) {
         cssHeight = containerHeight;
         cssWidth = containerHeight * OSCILLOSCOPE_ASPECT_RATIO;
     }
+    
+    // Ensure canvas doesn't exceed container bounds
+    cssWidth = Math.min(cssWidth, containerWidth);
+    cssHeight = Math.min(cssHeight, containerHeight);
     
     // Handle devicePixelRatio for HiDPI displays
     const dpr = window.devicePixelRatio || 1;
@@ -1317,37 +1909,22 @@ function resizeOscilloscopeCanvas() {
     oscilloscopeCanvas.width = cssWidth * dpr;
     oscilloscopeCanvas.height = cssHeight * dpr;
     
-    // Set canvas CSS size (logical pixels)
+    // Set canvas CSS size (logical pixels) - use explicit pixel values, not percentage
     oscilloscopeCanvas.style.width = cssWidth + 'px';
     oscilloscopeCanvas.style.height = cssHeight + 'px';
+    oscilloscopeCanvas.style.maxWidth = '100%'; // Prevent overflow
+    oscilloscopeCanvas.style.maxHeight = '100%'; // Prevent overflow
     
     // Reset transform and scale context to account for devicePixelRatio
     oscilloscopeCtx.setTransform(1, 0, 0, 1, 0, 0);
     oscilloscopeCtx.scale(dpr, dpr);
     
-    // Resize axis canvas (fixed width, same height as waveform)
-    if (oscilloscopeAxisCanvas) {
-        oscilloscopeAxisCanvas.width = axisWidth * dpr;
-        oscilloscopeAxisCanvas.height = cssHeight * dpr;
-        oscilloscopeAxisCanvas.style.width = axisWidth + 'px';
-        oscilloscopeAxisCanvas.style.height = cssHeight + 'px';
-        // Reset transform and scale for axis canvas
-        oscilloscopeAxisCtx.setTransform(1, 0, 0, 1, 0, 0);
-        oscilloscopeAxisCtx.scale(dpr, dpr);
-    }
-    
-    // Update buffer size when canvas resizes (no-op now, but kept for compatibility)
+    // Update buffer size when canvas resizes
     updateWaveformBufferSize();
     
     // Redraw if we have data
     if (waveformBuffer.length > 0) {
         drawOscilloscopeWrapper();
-    }
-    
-    // Always redraw axis (it's static)
-    if (oscilloscopeAxisCtx && oscilloscopeAxisCanvas) {
-        // Use CSS dimensions for axis drawing
-        drawAmplitudeAxis(oscilloscopeAxisCtx, axisWidth, cssHeight);
     }
 }
 
@@ -1462,114 +2039,173 @@ function updateBandStates(fftData, binFrequencies) {
  * Draw the band visualizer
  * Uses instantValue for main bar and peakValue for peak cap indicator
  */
-function drawBandVisualizer() {
-    if (!bandVisualizerCtx || !bandVisualizerCanvas || bandStates.length === 0) {
+/**
+ * Draw Vector Scope (Lissajous curve) visualization
+ * Rotated 45 degrees so Vertical = Mono, Horizontal = Stereo
+ * Uses "Cool" color palette (Blue->Cyan->White) based on amplitude
+ * @param {CanvasRenderingContext2D} ctx - Canvas rendering context
+ * @param {Float32Array} leftData - Left channel time-domain data
+ * @param {Float32Array} rightData - Right channel time-domain data
+ * @param {number} width - Canvas width
+ * @param {number} height - Canvas height
+ * @param {string} color - CSS color string for border/glow (traffic light status) - NOT used for line color
+ */
+function drawScope(ctx, leftData, rightData, width, height, color) {
+    if (!ctx || !leftData || !rightData || leftData.length === 0 || rightData.length === 0) {
         return;
     }
     
-    const width = bandVisualizerCanvas.width;
-    const height = bandVisualizerCanvas.height;
+    const centerWidth = width / 2;
+    const centerHeight = height / 2;
     
-    // Clear canvas
-    bandVisualizerCtx.fillStyle = '#030712'; // gray-950
-    bandVisualizerCtx.fillRect(0, 0, width, height);
+    // Scale factor to fit waveform in canvas (leave some margin)
+    const scale = Math.min(width, height) * 0.4;
     
-    // Calculate band width
-    const bandWidth = width / BAND_COUNT;
-    const bandHeight = height;
-    const padding = 2; // Padding between bands
-    const minVisible = 0.02; // Minimum visible fraction (2% of max height, only for drawing)
+    // Phosphor persistence effect: semi-transparent black overlay
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+    ctx.fillRect(0, 0, width, height);
     
-    // Draw each band
-    for (let i = 0; i < BAND_COUNT; i++) {
-        const bandState = bandStates[i];
-        const x = i * bandWidth;
-        const barX = x + padding;
-        const barWidth = bandWidth - padding * 2;
+    // Draw center crosshair (subtle grid lines)
+    ctx.strokeStyle = 'rgba(107, 114, 128, 0.2)'; // gray-500 with low opacity
+    ctx.lineWidth = 1;
+    
+    // Vertical line (mono indicator)
+    ctx.beginPath();
+    ctx.moveTo(centerWidth, 0);
+    ctx.lineTo(centerWidth, height);
+    ctx.stroke();
+    
+    // Horizontal line (stereo indicator)
+    ctx.beginPath();
+    ctx.moveTo(0, centerHeight);
+    ctx.lineTo(width, centerHeight);
+    ctx.stroke();
+    
+    // ===== CALCULATE TOTAL BAND ENERGY (RMS) FOR COLOR =====
+    // Calculate RMS (Root Mean Square) of both channels to determine overall amplitude
+    let sumSquares = 0;
+    let validSamples = 0;
+    const minLength = Math.min(leftData.length, rightData.length);
+    
+    for (let i = 0; i < minLength; i++) {
+        const left = leftData[i];
+        const right = rightData[i];
         
-        // Use instantValue for main bar (no peak hold)
-        const instantValue = bandState.instantValue || 0;
-        const instantDisplay = instantValue > 0 ? Math.max(minVisible, instantValue) : 0;
-        const barHeight = instantDisplay * bandHeight;
-        
-        // Draw band background (subtle)
-        bandVisualizerCtx.fillStyle = 'rgba(31, 41, 55, 0.5)'; // gray-800 with transparency
-        bandVisualizerCtx.fillRect(barX, 0, barWidth, bandHeight);
-        
-        // Draw main bar (from bottom up) using instantValue
-        if (barHeight > 0) {
-            const barY = bandHeight - barHeight;
-            
-            // Create gradient for amplitude-driven color (brighter at top)
-            const gradient = bandVisualizerCtx.createLinearGradient(x, barY, x, bandHeight);
-            const baseColor = bandState.color;
-            
-            // Convert hex to RGB
-            const r = parseInt(baseColor.slice(1, 3), 16);
-            const g = parseInt(baseColor.slice(3, 5), 16);
-            const b = parseInt(baseColor.slice(5, 7), 16);
-            
-            // Top of bar (brighter)
-            gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.9)`);
-            // Bottom of bar (dimmer)
-            gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0.3)`);
-            
-            bandVisualizerCtx.fillStyle = gradient;
-            bandVisualizerCtx.fillRect(barX, barY, barWidth, barHeight);
+        if (isFinite(left) && isFinite(right)) {
+            // Average of both channels for mono representation
+            const avg = (left + right) / 2;
+            sumSquares += avg * avg;
+            validSamples++;
         }
-        
-        // Draw peak cap indicator (small rectangle at peak height)
-        if (bandState.peakValue > 0) {
-            const peakHeight = bandState.peakValue * bandHeight;
-            const peakY = bandHeight - peakHeight;
-            const capHeight = Math.max(2, bandHeight * 0.02); // Small cap, at least 2px
-            
-            bandVisualizerCtx.fillStyle = 'rgba(255, 255, 255, 0.9)'; // White peak cap
-            bandVisualizerCtx.fillRect(barX, peakY - capHeight, barWidth, capHeight);
-        }
-        
-        // Store screen geometry for hover detection
-        const bandDef = bandDefinitions[i];
-        bandState.screenX = barX;
-        bandState.screenY = 0;
-        bandState.screenWidth = barWidth;
-        bandState.screenHeight = bandHeight;
-        // Store band definition reference for tooltip
-        bandState.bandDef = bandDef;
     }
+    
+    // Calculate RMS and normalize to [0, 1]
+    const rms = validSamples > 0 ? Math.sqrt(sumSquares / validSamples) : 0;
+    const normalized = Math.max(0, Math.min(1, rms)); // Clamp to [0, 1]
+    
+    // Generate "Cool" color palette based on amplitude (matches Oscilloscope style)
+    // Hue: shifts from Blue (210) to Cyan (190) as amplitude increases
+    const hue = 210 - (normalized * 20);
+    
+    // Lightness: shifts from Dark (20) to Bright White (90) as amplitude increases
+    const lightness = 20 + (normalized * 70);
+    
+    // Alpha: shifts from Transparent (0.6) to Opaque (1.0) as amplitude increases
+    const alpha = 0.6 + (normalized * 0.4);
+    
+    // Create HSLA color string for the scope line
+    const coolColor = `hsla(${hue}, 100%, ${lightness}%, ${alpha})`;
+    
+    // ===== ADAPTIVE SAMPLING (AVOID SPIKES) =====
+    // Calculate step size to draw ~800 points regardless of FFT size
+    // This prevents the scope from becoming a jagged mess at high resolutions
+    const step = Math.max(1, Math.floor(leftData.length / 800));
+    
+    // Set color for the trace (using "Cool" palette, not the traffic light color)
+    ctx.fillStyle = coolColor;
+    ctx.strokeStyle = coolColor;
+    ctx.lineWidth = 1;
+    
+    // Draw Lissajous curve (rotated 45 degrees)
+    // Draw points as small dots for cleaner look
+    for (let i = 0; i < minLength; i += step) {
+        const left = leftData[i];
+        const right = rightData[i];
+        
+        // Skip invalid samples
+        if (!isFinite(left) || !isFinite(right)) {
+            continue;
+        }
+        
+        // Lissajous curve math (rotated 45 degrees):
+        // X = centerWidth + ((right - left) * scale)  // Horizontal = Stereo
+        // Y = centerHeight - ((right + left) * scale) // Vertical = Mono
+        // Note: Subtract for Y because screen Y increases downward, but we want positive mono to go up
+        const x = centerWidth + ((right - left) * scale);
+        const y = centerHeight - ((right + left) * scale);
+        
+        // Clamp to canvas bounds
+        const clampedX = Math.max(0, Math.min(width - 1, x));
+        const clampedY = Math.max(0, Math.min(height - 1, y));
+        
+        // Draw a small dot (1 pixel)
+        ctx.fillRect(Math.floor(clampedX), Math.floor(clampedY), 1, 1);
+    }
+    
+    // Note: The `color` parameter (traffic light status) is only used for the canvas border
+    // which is set via boxShadow in the calling code. The line color uses the "Cool" palette above.
 }
 
 /**
- * Resize band visualizer canvas to match container size
+ * Resize multi-band vector scope canvases to match container size
+ * Each canvas takes 1/4 of the container width (4-band)
  */
-function resizeBandVisualizerCanvas() {
-    if (!bandVisualizerCanvas || !bandVisualizerContainer) return;
+function resizeVectorScopeCanvas() {
+    if (!scopeSubCanvas || !scopeLowCanvas || !scopeMidCanvas || !scopeHighCanvas || !vectorScopeContainer) return;
     
-    const containerWidth = bandVisualizerContainer.clientWidth;
-    const containerHeight = bandVisualizerContainer.clientHeight;
+    // Get container dimensions (accounting for gap-4 = 1rem = 16px, 3 gaps = 48px total)
+    const containerWidth = vectorScopeContainer.clientWidth;
+    const containerHeight = vectorScopeContainer.clientHeight;
     
-    let newWidth = containerWidth;
-    let newHeight = containerWidth / BAND_VISUALIZER_ASPECT_RATIO;
+    // Each canvas gets 1/4 of the width (minus gaps)
+    const gap = 16; // gap-4 = 1rem = 16px
+    const totalGaps = gap * 3; // 3 gaps between 4 canvases
+    const canvasWidth = (containerWidth - totalGaps) / 4;
+    const canvasHeight = Math.min(250, containerHeight - 40); // Leave room for labels
     
-    if (newHeight > containerHeight) {
-        newHeight = containerHeight;
-        newWidth = containerHeight * BAND_VISUALIZER_ASPECT_RATIO;
-    }
+    // Handle devicePixelRatio for HiDPI displays
+    const dpr = window.devicePixelRatio || 1;
     
-    bandVisualizerCanvas.width = newWidth;
-    bandVisualizerCanvas.height = newHeight;
+    // Resize all four canvases
+    const canvases = [
+        { canvas: scopeSubCanvas, ctx: scopeSubCtx },
+        { canvas: scopeLowCanvas, ctx: scopeLowCtx },
+        { canvas: scopeMidCanvas, ctx: scopeMidCtx },
+        { canvas: scopeHighCanvas, ctx: scopeHighCtx }
+    ];
     
-    // Redraw if we have data
-    if (bandStates.length > 0) {
-        drawBandVisualizer();
-    }
+    canvases.forEach(({ canvas, ctx }) => {
+        if (!canvas || !ctx) return;
+        
+        // Set canvas internal resolution (device pixels)
+        canvas.width = canvasWidth * dpr;
+        canvas.height = canvasHeight * dpr;
+        
+        // Set canvas CSS size (logical pixels)
+        canvas.style.width = canvasWidth + 'px';
+        canvas.style.height = canvasHeight + 'px';
+        
+        // Reset transform and scale context to account for devicePixelRatio
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.scale(dpr, dpr);
+    });
 }
 
 /**
  * Update function: Read FFT data from analyser and apply smoothing
  */
 function update() {
-    if (!analyser) {
+    if (!analyserLeft) {
         if (Math.random() < 0.01) {
             console.warn('Update: No analyser available');
         }
@@ -1583,8 +2219,8 @@ function update() {
         return;
     }
     
-    // Read FFT data from analyser
-    analyser.getFloatFrequencyData(fftData);
+    // Read FFT data from left analyser (for spectrum visualization)
+    analyserLeft.getFloatFrequencyData(fftData);
     
     // Check if we're getting any valid values (-Infinity is valid, NaN is not)
     const hasAnyData = Array.from(fftData).some(val => !isNaN(val));
@@ -1614,6 +2250,20 @@ function update() {
     // Update waveform buffer
     updateWaveform();
     
+    // Update multi-band time-domain data arrays (for multi-band vector scope)
+    if (analyserSubL && analyserSubR && analyserLowL && analyserLowR && analyserMidL && analyserMidR && analyserHighL && analyserHighR &&
+        timeDomainDataSubL && timeDomainDataSubR && timeDomainDataLowL && timeDomainDataLowR && timeDomainDataMidL && timeDomainDataMidR && 
+        timeDomainDataHighL && timeDomainDataHighR) {
+        analyserSubL.getFloatTimeDomainData(timeDomainDataSubL);
+        analyserSubR.getFloatTimeDomainData(timeDomainDataSubR);
+        analyserLowL.getFloatTimeDomainData(timeDomainDataLowL);
+        analyserLowR.getFloatTimeDomainData(timeDomainDataLowR);
+        analyserMidL.getFloatTimeDomainData(timeDomainDataMidL);
+        analyserMidR.getFloatTimeDomainData(timeDomainDataMidR);
+        analyserHighL.getFloatTimeDomainData(timeDomainDataHighL);
+        analyserHighR.getFloatTimeDomainData(timeDomainDataHighR);
+    }
+    
     // Update band states with smoothed FFT data
     if (smoothedData && audioContext) {
         const binFrequencies = computeBinFrequencies();
@@ -1624,18 +2274,20 @@ function update() {
 }
 
 /**
- * Draw the spectrum with two layers: Live fill (smoothedData) and Average curve (averageData)
+ * Draw the spectrum with two layers: Live bars (MAX) and Average curve (AVERAGE)
+ * Uses pixel-based loop for "Vision 4X" bar chart aesthetic
  * @param {Float32Array} smoothed - Smoothed FFT data array (not used directly, kept for compatibility)
  * @param {CanvasRenderingContext2D} ctx - Canvas rendering context
  * @param {number} width - Canvas width
  * @param {number} height - Canvas height
  */
 function drawSpectrum(smoothed, ctx, width, height) {
-    if (!smoothedData || smoothedData.length === 0 || !averageData || averageData.length === 0 || !audioContext) {
+    if (!smoothedData || smoothedData.length === 0 || !averageData || averageData.length === 0 || !audioContext || !analyserLeft) {
         console.warn('drawSpectrum: No data available', {
             hasSmoothedData: !!smoothedData,
             hasAverageData: !!averageData,
-            hasAudioContext: !!audioContext
+            hasAudioContext: !!audioContext,
+            hasAnalyserLeft: !!analyserLeft
         });
         return;
     }
@@ -1658,87 +2310,83 @@ function drawSpectrum(smoothed, ctx, width, height) {
     ctx.fillStyle = '#030712'; // gray-950
     ctx.fillRect(activeLeft, activeTop, activeWidth, activeHeight);
     
-    // ===== LAYER 1: Live Fill (smoothedData) =====
-    // Draw smoothedData as a filled area with gradient
-    ctx.beginPath();
-    let firstPoint = true;
-    let firstX = null;
-    let firstY = null;
+    const fftSize = analyserLeft.fftSize;
     
-    // Build path for smoothedData (live data)
-    for (let i = 0; i < smoothedData.length; i++) {
-        const freq = binFrequency(i, getSampleRate(), smoothedData.length);
+    // Array to store average curve points
+    const averagePoints = [];
+    
+    // ===== PIXEL-BASED LOOP =====
+    // Iterate from MARGIN_LEFT to width - MARGIN_RIGHT (one iteration per pixel column)
+    for (let x = activeLeft; x < activeRight; x++) {
+        // Calculate frequency range for this pixel
+        const startFreq = xToFrequency(x, width);
+        const endFreq = xToFrequency(x + 1, width);
         
-        // Skip bins outside the frequency range
-        if (freq < MIN_FREQ || freq > MAX_FREQ) {
-            continue;
+        // Convert frequency range to FFT bin indices
+        const binStart = getBinIndex(startFreq, fftSize);
+        const binEnd = getBinIndex(endFreq, fftSize);
+        
+        // ===== LAYER 1: Live Data (MAX amplitude - "Vision 4X" bars) =====
+        // Find MAX amplitude in the bin range for this pixel
+        let maxDb = -Infinity;
+        for (let binIdx = binStart; binIdx <= binEnd && binIdx < smoothedData.length; binIdx++) {
+            const dbValue = smoothedData[binIdx];
+            if (isFinite(dbValue) && dbValue > maxDb) {
+                maxDb = dbValue;
+            }
         }
         
-        const x = frequencyToX(freq, width);
-        const y = dbToY(smoothedData[i], height);
-        
-        // Clamp Y to active draw area
-        const clampedY = Math.max(activeTop, Math.min(activeBottom, y));
-        
-        if (firstPoint) {
-            firstX = x;
-            firstY = clampedY;
-            ctx.moveTo(x, clampedY);
-            firstPoint = false;
-        } else {
-            ctx.lineTo(x, clampedY);
-        }
-    }
-    
-    // Close path for fill (connect to bottom corners)
-    if (firstX !== null) {
-        const lastX = frequencyToX(MAX_FREQ, width);
-        ctx.lineTo(lastX, activeBottom);
-        ctx.lineTo(firstX, activeBottom);
-        ctx.closePath();
-        
-        // Create gradient fill (blue to cyan to white) for live data
-        const gradient = ctx.createLinearGradient(0, activeTop, 0, activeBottom);
-        gradient.addColorStop(0, 'rgba(59, 130, 246, 0.6)');   // blue-500
-        gradient.addColorStop(0.5, 'rgba(34, 211, 238, 0.6)');  // cyan-400
-        gradient.addColorStop(1, 'rgba(236, 254, 255, 0.4)');   // cyan-50
-        
-        ctx.fillStyle = gradient;
-        ctx.fill();
-    }
-    
-    // ===== LAYER 2: Average Curve (averageData) =====
-    // Draw averageData as a bright line on top
-    ctx.beginPath();
-    firstPoint = true;
-    
-    // Build path for averageData (long-term average)
-    for (let i = 0; i < averageData.length; i++) {
-        const freq = binFrequency(i, getSampleRate(), averageData.length);
-        
-        // Skip bins outside the frequency range
-        if (freq < MIN_FREQ || freq > MAX_FREQ) {
-            continue;
+        // Draw vertical 1px wide line from bottom up to max amplitude
+        if (isFinite(maxDb)) {
+            const y = dbToY(maxDb, height);
+            const clampedY = Math.max(activeTop, Math.min(activeBottom, y));
+            const barHeight = activeBottom - clampedY;
+            
+            if (barHeight > 0) {
+                // Use gradient color based on amplitude
+                const normalized = Math.max(0, Math.min(1, (maxDb - MIN_DB) / (MAX_DB - MIN_DB)));
+                const hue = 180; // Cyan
+                const saturation = 100;
+                const lightness = 20 + (normalized * 80);
+                const alpha = 0.3 + (normalized * 0.7);
+                
+                ctx.fillStyle = `hsla(${hue}, ${saturation}%, ${lightness}%, ${alpha})`;
+                ctx.fillRect(x, clampedY, 1, barHeight);
+            }
         }
         
-        const x = frequencyToX(freq, width);
-        const y = dbToY(averageData[i], height);
+        // ===== LAYER 2: Average Data (AVERAGE amplitude - smooth curve) =====
+        // Find AVERAGE amplitude in the bin range for this pixel (simple arithmetic mean)
+        let sumDb = 0;
+        let count = 0;
+        for (let binIdx = binStart; binIdx <= binEnd && binIdx < averageData.length; binIdx++) {
+            const dbValue = averageData[binIdx];
+            if (isFinite(dbValue)) {
+                sumDb += dbValue;
+                count++;
+            }
+        }
         
-        // Clamp Y to active draw area
-        const clampedY = Math.max(activeTop, Math.min(activeBottom, y));
-        
-        if (firstPoint) {
-            ctx.moveTo(x, clampedY);
-            firstPoint = false;
-        } else {
-            ctx.lineTo(x, clampedY);
+        // Calculate average dB value
+        if (count > 0) {
+            const avgDb = sumDb / count;
+            const y = dbToY(avgDb, height);
+            const clampedY = Math.max(activeTop, Math.min(activeBottom, y));
+            averagePoints.push({ x: x, y: clampedY });
         }
     }
     
-    // Draw the average curve as a bright cyan/white line
-    ctx.strokeStyle = '#67e8f9'; // cyan-300 - bright and visible
-    ctx.lineWidth = 2;
-    ctx.stroke();
+    // Draw smooth stroked line connecting averaged points (Layer 2)
+    if (averagePoints.length > 0) {
+        ctx.beginPath();
+        ctx.moveTo(averagePoints[0].x, averagePoints[0].y);
+        for (let i = 1; i < averagePoints.length; i++) {
+            ctx.lineTo(averagePoints[i].x, averagePoints[i].y);
+        }
+        ctx.strokeStyle = '#67e8f9'; // cyan-300 - bright and visible
+        ctx.lineWidth = 2;
+        ctx.stroke();
+    }
     
     // Restore context (removes clipping)
     ctx.restore();
@@ -1899,7 +2547,7 @@ function draw() {
             console.warn('draw: smoothedData has no valid values', {
                 length: smoothedData.length,
                 first10: Array.from(smoothedData.slice(0, 10)),
-                hasAnalyser: !!analyser,
+                hasAnalyserLeft: !!analyserLeft,
                 hasFftData: !!fftData
             });
             ctx.fillStyle = '#ff0000';
@@ -1923,17 +2571,66 @@ function draw() {
     // Draw dB scale markers on the left
     drawDbMarkers(ctx, canvas.width, canvas.height);
     
-    // Draw band visualizer
-    drawBandVisualizer();
+    // Draw multi-band vector scopes with phase correlation
+    const dpr = window.devicePixelRatio || 1;
     
-    // Draw oscilloscope amplitude axis (static, redraws every frame)
-    if (oscilloscopeAxisCtx && oscilloscopeAxisCanvas) {
-        const axisCssWidth = oscilloscopeAxisCanvas.width / (window.devicePixelRatio || 1);
-        const axisCssHeight = oscilloscopeAxisCanvas.height / (window.devicePixelRatio || 1);
-        drawAmplitudeAxis(oscilloscopeAxisCtx, axisCssWidth, axisCssHeight);
+    // Sub band scope
+    if (timeDomainDataSubL && timeDomainDataSubR && scopeSubCanvas && scopeSubCtx) {
+        const correlation = calculateCorrelation(timeDomainDataSubL, timeDomainDataSubR);
+        const { color } = getPhaseColor(correlation, 'sub');
+        
+        // Apply glowing border using the color
+        scopeSubCanvas.style.boxShadow = `0 0 20px ${color}`;
+        
+        // Draw scope
+        const cssWidth = scopeSubCanvas.width / dpr;
+        const cssHeight = scopeSubCanvas.height / dpr;
+        drawScope(scopeSubCtx, timeDomainDataSubL, timeDomainDataSubR, cssWidth, cssHeight, color);
     }
     
-    // Draw oscilloscope
+    // Low band scope
+    if (timeDomainDataLowL && timeDomainDataLowR && scopeLowCanvas && scopeLowCtx) {
+        const correlation = calculateCorrelation(timeDomainDataLowL, timeDomainDataLowR);
+        const { color } = getPhaseColor(correlation, 'low');
+        
+        // Apply glowing border using the color
+        scopeLowCanvas.style.boxShadow = `0 0 20px ${color}`;
+        
+        // Draw scope
+        const cssWidth = scopeLowCanvas.width / dpr;
+        const cssHeight = scopeLowCanvas.height / dpr;
+        drawScope(scopeLowCtx, timeDomainDataLowL, timeDomainDataLowR, cssWidth, cssHeight, color);
+    }
+    
+    // Mid band scope
+    if (timeDomainDataMidL && timeDomainDataMidR && scopeMidCanvas && scopeMidCtx) {
+        const correlation = calculateCorrelation(timeDomainDataMidL, timeDomainDataMidR);
+        const { color } = getPhaseColor(correlation, 'mid');
+        
+        // Apply glowing border using the color
+        scopeMidCanvas.style.boxShadow = `0 0 20px ${color}`;
+        
+        // Draw scope
+        const cssWidth = scopeMidCanvas.width / dpr;
+        const cssHeight = scopeMidCanvas.height / dpr;
+        drawScope(scopeMidCtx, timeDomainDataMidL, timeDomainDataMidR, cssWidth, cssHeight, color);
+    }
+    
+    // High band scope
+    if (timeDomainDataHighL && timeDomainDataHighR && scopeHighCanvas && scopeHighCtx) {
+        const correlation = calculateCorrelation(timeDomainDataHighL, timeDomainDataHighR);
+        const { color } = getPhaseColor(correlation, 'high');
+        
+        // Apply glowing border using the color
+        scopeHighCanvas.style.boxShadow = `0 0 20px ${color}`;
+        
+        // Draw scope
+        const cssWidth = scopeHighCanvas.width / dpr;
+        const cssHeight = scopeHighCanvas.height / dpr;
+        drawScope(scopeHighCtx, timeDomainDataHighL, timeDomainDataHighR, cssWidth, cssHeight, color);
+    }
+    
+    // Draw oscilloscope (axis is now drawn internally)
     drawOscilloscopeWrapper();
 }
 
@@ -1952,7 +2649,8 @@ function animate() {
     // Log every 60 frames (~1 second at 60fps)
     if (frameCount % 60 === 0) {
         console.log('Animation running, frame:', frameCount, {
-            hasAnalyser: !!analyser,
+            hasAnalyserLeft: !!analyserLeft,
+            hasAnalyserRight: !!analyserRight,
             hasFftData: !!fftData,
             hasSmoothedData: !!smoothedData,
             smoothedDataLength: smoothedData ? smoothedData.length : 0
@@ -1969,7 +2667,7 @@ function animate() {
  * Start the animation loop
  */
 function startAnimationLoop() {
-    if (!isAnimating && analyser) {
+    if (!isAnimating && analyserLeft) {
         isAnimating = true;
         animate();
     }
@@ -1992,7 +2690,7 @@ function stopAnimationLoop() {
 function startVisualization() {
     console.log('startVisualization called');
     console.log('AudioContext state:', audioContext ? audioContext.state : 'null');
-    console.log('Analyser available:', !!analyser);
+    console.log('Analysers available:', { left: !!analyserLeft, right: !!analyserRight });
     console.log('Is animating:', isAnimating);
     
     // Resume AudioContext if suspended - CRITICAL for audio to flow
@@ -2002,7 +2700,7 @@ function startVisualization() {
             console.log('AudioContext resumed successfully, state:', audioContext.state);
             
             // Start animation loop after context is resumed
-            if (analyser && !isAnimating) {
+            if (analyserLeft && !isAnimating) {
                 console.log('Starting animation loop...');
                 startAnimationLoop();
             }
@@ -2011,12 +2709,13 @@ function startVisualization() {
         });
     } else {
         // Start animation loop if analyser is available
-        if (analyser && !isAnimating) {
+        if (analyserLeft && !isAnimating) {
             console.log('Starting animation loop...');
             startAnimationLoop();
         } else {
             console.warn('Cannot start animation:', {
-                hasAnalyser: !!analyser,
+                hasAnalyserLeft: !!analyserLeft,
+                hasAnalyserRight: !!analyserRight,
                 isAnimating: isAnimating,
                 audioContextState: audioContext ? audioContext.state : 'null'
             });
@@ -2203,6 +2902,22 @@ viewLengthSelect.addEventListener('change', handleViewLengthChange);
 if (decaySpeedSlider) {
     decaySpeedSlider.addEventListener('input', handleDecaySpeedChange);
 }
+if (fftSizeSelect) {
+    fftSizeSelect.addEventListener('change', (e) => {
+        const newSize = parseInt(e.target.value, 10);
+        if (isFinite(newSize) && newSize > 0) {
+            updateFFTSize(newSize);
+        } else {
+            console.warn('Invalid FFT size value:', e.target.value);
+        }
+    });
+}
+
+// Mono scope checkbox - no event listener needed
+// The checkbox state is checked in updateWaveform() each frame, so changes take effect automatically
+if (monoScopeCheck) {
+    console.log('Mono scope checkbox initialized');
+}
 
 // Initialize alpha from slider's initial value
 handleSmoothingChange();
@@ -2212,7 +2927,7 @@ handleDecaySpeedChange();
 
 // Initialize canvas size
 resizeCanvas();
-resizeBandVisualizerCanvas();
+resizeVectorScopeCanvas();
 resizeOscilloscopeCanvas();
 
 // Test canvas rendering
@@ -2247,33 +2962,34 @@ if (oscilloscopeCtx && oscilloscopeCanvas) {
     oscilloscopeCtx.fillText('Oscilloscope ready - Click Play to start', oscilloscopeCanvas.width / 2, oscilloscopeCanvas.height / 2);
 }
 
-// Initialize oscilloscope axis canvas
-if (oscilloscopeAxisCtx && oscilloscopeAxisCanvas) {
-    console.log('Oscilloscope axis canvas initialized:', {
-        width: oscilloscopeAxisCanvas.width,
-        height: oscilloscopeAxisCanvas.height,
-        hasContext: !!oscilloscopeAxisCtx
-    });
-    // Draw the amplitude axis immediately
-    drawAmplitudeAxis(oscilloscopeAxisCtx, oscilloscopeAxisCanvas.width, oscilloscopeAxisCanvas.height);
-}
+// Oscilloscope axis is now drawn internally in drawOscilloscope
 
-// Test band visualizer canvas rendering
-if (bandVisualizerCtx && bandVisualizerCanvas) {
-    console.log('Band visualizer canvas initialized:', {
-        width: bandVisualizerCanvas.width,
-        height: bandVisualizerCanvas.height,
-        hasContext: !!bandVisualizerCtx,
-        bandCount: BAND_COUNT
-    });
-    // Draw a test pattern
-    bandVisualizerCtx.fillStyle = '#1f2937';
-    bandVisualizerCtx.fillRect(0, 0, bandVisualizerCanvas.width, bandVisualizerCanvas.height);
-    bandVisualizerCtx.fillStyle = '#ffffff';
-    bandVisualizerCtx.font = '14px system-ui';
-    bandVisualizerCtx.textAlign = 'center';
-    bandVisualizerCtx.fillText('Energy Density Bands ready - Click Play to start', bandVisualizerCanvas.width / 2, bandVisualizerCanvas.height / 2);
-}
+// Initialize multi-band vector scope canvases
+const scopeCanvases = [
+    { canvas: scopeLowCanvas, ctx: scopeLowCtx, label: 'Low' },
+    { canvas: scopeMidCanvas, ctx: scopeMidCtx, label: 'Mid' },
+    { canvas: scopeHighCanvas, ctx: scopeHighCtx, label: 'High' }
+];
+
+scopeCanvases.forEach(({ canvas, ctx, label }) => {
+    if (canvas && ctx) {
+        console.log(`Vector scope ${label} canvas initialized:`, {
+            width: canvas.width,
+            height: canvas.height,
+            hasContext: !!ctx
+        });
+        // Draw initial background
+        const dpr = window.devicePixelRatio || 1;
+        ctx.fillStyle = '#030712'; // gray-950
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '14px system-ui';
+        ctx.textAlign = 'center';
+        const cssWidth = canvas.width / dpr;
+        const cssHeight = canvas.height / dpr;
+        ctx.fillText(`${label} Scope ready - Click Play to start`, cssWidth / 2, cssHeight / 2);
+    }
+});
 
 // Add window resize event listener with debouncing
 let resizeTimeout;
@@ -2281,7 +2997,7 @@ window.addEventListener('resize', () => {
     clearTimeout(resizeTimeout);
     resizeTimeout = setTimeout(() => {
         resizeCanvas();
-        resizeBandVisualizerCanvas();
+        resizeVectorScopeCanvas();
         resizeOscilloscopeCanvas();
     }, 100); // Debounce resize events
 });
@@ -2368,13 +3084,5 @@ function handleMouseMove(event) {
     tooltip.style.display = 'block';
 }
 
-// Register mouse event listeners
-if (bandVisualizerCanvas) {
-    bandVisualizerCanvas.addEventListener('mousemove', handleMouseMove);
-    bandVisualizerCanvas.addEventListener('mouseleave', () => {
-        if (tooltip) {
-            tooltip.style.display = 'none';
-        }
-    });
-}
+// Vector scope doesn't need mouse event handlers (no tooltips)
 
