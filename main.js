@@ -4,7 +4,8 @@ let analyser = null;
 
 // FFT data arrays
 let fftData = null;
-let smoothedData = null;
+let smoothedData = null; // Fast/Live data (fixed fast smoothing)
+let averageData = null;  // Long-term average data (variable smoothing from slider)
 let frequencyBinCount = 0;
 
 // Animation loop
@@ -54,10 +55,19 @@ const oscilloscopeAxisCtx = oscilloscopeAxisCanvas ? oscilloscopeAxisCanvas.getC
 // Oscilloscope state
 let timeDomainData = null; // Reusable Float32Array for time-domain data (allocated in initializeAudioContext)
 let waveformBuffer = []; // Circular buffer for storing raw waveform samples (no downsampling)
+let waveformColorBuffer = []; // Circular buffer for storing RGB color strings (parallel to waveformBuffer)
 let waveformBufferSize = 0; // Maximum buffer size (calculated based on view duration)
 let waveformWriteIndex = 0; // Current write position in circular buffer
 let lastTimeDomainSampleIdx = 0; // Track which samples we've already added to buffer
 const OSCILLOSCOPE_ASPECT_RATIO = 4; // 800x200 = 4:1
+
+// Frequency band definitions for color calculation
+const FREQ_BAND_LOWS_MIN = 20;    // 20 Hz
+const FREQ_BAND_LOWS_MAX = 250;   // 250 Hz
+const FREQ_BAND_MIDS_MIN = 250;   // 250 Hz
+const FREQ_BAND_MIDS_MAX = 2500;  // 2.5 kHz
+const FREQ_BAND_HIGHS_MIN = 2500; // 2.5 kHz
+const FREQ_BAND_HIGHS_MAX = 20000; // 20 kHz
 
 // Band Visualizer canvas setup
 const bandVisualizerCanvas = document.getElementById('band-visualizer-canvas');
@@ -279,10 +289,13 @@ function getCategoryGain(category) {
     }
 }
 
-// EMA smoothing alpha value (0-1, where lower = more smoothing, higher = less smoothing)
-// Default: 0.5 (moderate smoothing)
-let emaAlpha = 0.5;
+// EMA smoothing alpha values
+// smoothedData uses fixed fast alpha (0.8) for responsive live view
+// averageData uses variable alpha from slider for long-term average
+const SMOOTHED_DATA_ALPHA = 0.8; // Fixed fast alpha for live data
+let averageDataAlpha = 0.5; // Variable alpha for average data (controlled by slider)
 let emaInitialized = false;
+let averageDataInitialized = false;
 
 // Global decay speed multiplier for energy density bands
 // 1.0 = current behavior, >1 = faster decay, <1 = slower decay
@@ -302,11 +315,17 @@ const MAX_DB = 0;        // Maximum dB value (full scale, 0 dB = maximum digital
 // dB window above threshold for full scale (wider range = less pegging)
 const ENERGY_DYNAMIC_RANGE_DB = 40; // dB window above threshold for full scale
 
-// Canvas padding to prevent labels from being cut off
-const CANVAS_PADDING_TOP = 20;    // Space for frequency markers at top
-const CANVAS_PADDING_BOTTOM = 10; // Space at bottom
-const CANVAS_PADDING_LEFT = 60;   // Space for dB labels on left
-const CANVAS_PADDING_RIGHT = 10;  // Space on right
+// Chart layout margins - define the active draw area
+const MARGIN_LEFT = 60;    // Space for dB labels on left
+const MARGIN_BOTTOM = 30;  // Space for frequency labels at bottom
+const MARGIN_TOP = 20;     // Space at top
+const MARGIN_RIGHT = 20;   // Space on right
+
+// Legacy constants for backward compatibility (will be removed after refactoring)
+const CANVAS_PADDING_TOP = MARGIN_TOP;
+const CANVAS_PADDING_BOTTOM = MARGIN_BOTTOM;
+const CANVAS_PADDING_LEFT = MARGIN_LEFT;
+const CANVAS_PADDING_RIGHT = MARGIN_RIGHT;
 
 /**
  * Calculate the frequency for a given FFT bin index
@@ -337,9 +356,61 @@ function frequencyToX(freq, width) {
     // Normalize to 0-1 range
     const normalized = (logFreq - logMin) / (logMax - logMin);
     
-    // Map to drawing area (accounting for left and right padding)
-    const drawingWidth = width - CANVAS_PADDING_LEFT - CANVAS_PADDING_RIGHT;
-    return CANVAS_PADDING_LEFT + normalized * drawingWidth;
+    // Map to active draw area (accounting for left and right margins)
+    const activeWidth = width - MARGIN_LEFT - MARGIN_RIGHT;
+    return MARGIN_LEFT + normalized * activeWidth;
+}
+
+/**
+ * Map an X coordinate to a frequency using inverse logarithmic scale
+ * This is the inverse of frequencyToX()
+ * @param {number} x - X coordinate in pixels
+ * @param {number} width - Canvas width in pixels
+ * @returns {number} Frequency in Hz
+ */
+function xToFrequency(x, width) {
+    // Account for left and right margins
+    const activeWidth = width - MARGIN_LEFT - MARGIN_RIGHT;
+    
+    // Get position in active draw area (0 to activeWidth)
+    const xInActiveArea = x - MARGIN_LEFT;
+    
+    // Normalize to 0-1 range
+    const normalized = activeWidth > 0 ? xInActiveArea / activeWidth : 0;
+    
+    // Clamp normalized value to valid range
+    const clampedNormalized = Math.max(0, Math.min(1, normalized));
+    
+    // Inverse logarithmic mapping: freq = min * (max/min)^normalized
+    // Using log10 for consistency with frequencyToX:
+    // log10(freq) = log10(MIN_FREQ) + normalized * (log10(MAX_FREQ) - log10(MIN_FREQ))
+    const logMin = Math.log10(MIN_FREQ);
+    const logMax = Math.log10(MAX_FREQ);
+    const logFreq = logMin + clampedNormalized * (logMax - logMin);
+    const freq = Math.pow(10, logFreq);
+    
+    return freq;
+}
+
+/**
+ * Get the FFT bin index for a given frequency
+ * @param {number} frequency - Frequency in Hz
+ * @param {number} fftSize - FFT size (e.g., 32768)
+ * @returns {number} Bin index (0 to fftSize/2 - 1)
+ */
+function getBinIndex(frequency, fftSize) {
+    if (!audioContext) {
+        return 0;
+    }
+    
+    const sampleRate = getSampleRate();
+    const binCount = fftSize / 2;
+    
+    // Formula: binIndex = (frequency * fftSize) / sampleRate
+    const binIndex = Math.floor((frequency * fftSize) / sampleRate);
+    
+    // Clamp to valid bin range [0, binCount)
+    return Math.max(0, Math.min(binCount - 1, binIndex));
 }
 
 /**
@@ -349,9 +420,9 @@ function frequencyToX(freq, width) {
  * @returns {number} Y coordinate (accounting for top and bottom padding)
  */
 function dbToY(db, height) {
-    // Handle -Infinity (silence) - map to bottom of drawing area
+    // Handle -Infinity (silence) - map to bottom of active draw area
     if (!isFinite(db) || db === -Infinity) {
-        return height - CANVAS_PADDING_BOTTOM;
+        return height - MARGIN_BOTTOM;
     }
     
     // Clamp dB to valid range
@@ -360,9 +431,9 @@ function dbToY(db, height) {
     // Normalize dB to 0-1 range (inverted: higher dB = lower Y)
     const normalized = (clampedDb - MIN_DB) / (MAX_DB - MIN_DB);
     
-    // Map to drawing area (accounting for top and bottom padding, inverted: 0 at top, height at bottom)
-    const drawingHeight = height - CANVAS_PADDING_TOP - CANVAS_PADDING_BOTTOM;
-    return CANVAS_PADDING_TOP + (1 - normalized) * drawingHeight;
+    // Map to active draw area (accounting for top and bottom margins, inverted: 0 at top, height at bottom)
+    const activeHeight = height - MARGIN_TOP - MARGIN_BOTTOM;
+    return MARGIN_TOP + (1 - normalized) * activeHeight;
 }
 
 /**
@@ -431,7 +502,8 @@ function initializeAudioContext() {
         
         // Allocate FFT data arrays
         fftData = new Float32Array(frequencyBinCount);
-        smoothedData = new Float32Array(frequencyBinCount);
+        smoothedData = new Float32Array(frequencyBinCount); // Fast/Live data
+        averageData = new Float32Array(frequencyBinCount);  // Long-term average data
         
         // Allocate reusable time-domain data array (reused every frame to avoid allocations)
         timeDomainData = new Float32Array(analyser.fftSize);
@@ -629,6 +701,7 @@ function setupTestAudio(audioPath) {
     
     console.log('Setting audio src to:', audioPath);
     console.log('Encoded path:', encodedPath);
+    console.log('Full URL will be:', window.location.origin + '/' + encodedPath);
     
     audioElement.src = encodedPath;
     audioElement.load();
@@ -674,8 +747,9 @@ function cleanupTestAudio() {
     // Stop visualization
     stopVisualization();
     
-    // Reset EMA initialization flag for fresh start
+    // Reset EMA initialization flags for fresh start
     emaInitialized = false;
+    averageDataInitialized = false;
     
     if (currentAudioElement) {
         // Stop playback
@@ -775,10 +849,12 @@ function updateWaveformBufferSize() {
     // Add some headroom to ensure smooth scrolling
     waveformBufferSize = Math.max(1024, totalSamplesNeeded);
     
-    // Resize buffer if needed
+    // Resize buffers if needed
     if (waveformBuffer.length !== waveformBufferSize) {
         const oldBuffer = waveformBuffer;
+        const oldColorBuffer = waveformColorBuffer;
         waveformBuffer = new Array(waveformBufferSize).fill(0);
+        waveformColorBuffer = new Array(waveformBufferSize).fill('#808080'); // Default gray color
         
         // Copy old data if buffer is growing (preserve recent history)
         if (oldBuffer.length > 0) {
@@ -786,6 +862,7 @@ function updateWaveformBufferSize() {
             const oldStart = Math.max(0, oldBuffer.length - copyLength);
             for (let i = 0; i < copyLength; i++) {
                 waveformBuffer[waveformBufferSize - copyLength + i] = oldBuffer[oldStart + i];
+                waveformColorBuffer[waveformBufferSize - copyLength + i] = oldColorBuffer[oldStart + i] || '#808080';
             }
         }
         
@@ -805,31 +882,134 @@ function updateWaveformBufferSize() {
 }
 
 /**
- * Update waveform buffer with new time-domain data
- * Only adds NEW samples that haven't been buffered yet
- * The time-domain data is a rolling window, so we track which samples are new
+ * Calculate frequency band energy and convert to RGB color
+ * @param {Float32Array} fftData - Current FFT frequency data in dB
+ * @param {number} fftSize - FFT size
+ * @returns {string} RGB color string (e.g., "rgb(255, 50, 100)")
+ */
+function calculateFrequencyColor(fftData, fftSize) {
+    if (!fftData || !audioContext) {
+        return 'rgb(128, 128, 128)'; // Default gray
+    }
+    
+    const sampleRate = getSampleRate();
+    const binCount = fftSize / 2;
+    
+    // Calculate bin indices for frequency bands
+    const lowsStartBin = getBinIndex(FREQ_BAND_LOWS_MIN, fftSize);
+    const lowsEndBin = getBinIndex(FREQ_BAND_LOWS_MAX, fftSize);
+    const midsStartBin = getBinIndex(FREQ_BAND_MIDS_MIN, fftSize);
+    const midsEndBin = getBinIndex(FREQ_BAND_MIDS_MAX, fftSize);
+    const highsStartBin = getBinIndex(FREQ_BAND_HIGHS_MIN, fftSize);
+    const highsEndBin = getBinIndex(FREQ_BAND_HIGHS_MAX, fftSize);
+    
+    // Calculate energy in each band (convert dB to linear, sum, then back to dB)
+    let lowsEnergy = 0;
+    let midsEnergy = 0;
+    let highsEnergy = 0;
+    let lowsCount = 0;
+    let midsCount = 0;
+    let highsCount = 0;
+    
+    for (let i = 0; i < fftData.length; i++) {
+        const dbValue = fftData[i];
+        if (!isFinite(dbValue) || dbValue === -Infinity) {
+            continue;
+        }
+        
+        // Convert dB to linear scale for energy calculation
+        const linearValue = Math.pow(10, dbValue / 20);
+        const energy = linearValue * linearValue;
+        
+        if (i >= lowsStartBin && i <= lowsEndBin) {
+            lowsEnergy += energy;
+            lowsCount++;
+        } else if (i >= midsStartBin && i <= midsEndBin) {
+            midsEnergy += energy;
+            midsCount++;
+        } else if (i >= highsStartBin && i <= highsEndBin) {
+            highsEnergy += energy;
+            highsCount++;
+        }
+    }
+    
+    // Calculate average energy per band (avoid division by zero)
+    const lowsAvg = lowsCount > 0 ? lowsEnergy / lowsCount : 0;
+    const midsAvg = midsCount > 0 ? midsEnergy / midsCount : 0;
+    const highsAvg = highsCount > 0 ? highsEnergy / highsCount : 0;
+    
+    // Total energy for normalization
+    const totalEnergy = lowsAvg + midsAvg + highsAvg;
+    
+    // Normalize and convert to RGB (0-255)
+    // Lows -> Red channel, Mids -> Green channel, Highs -> Blue channel
+    let r = 0, g = 0, b = 0;
+    
+    if (totalEnergy > 0) {
+        const lowsNorm = lowsAvg / totalEnergy;
+        const midsNorm = midsAvg / totalEnergy;
+        const highsNorm = highsAvg / totalEnergy;
+        
+        // Map normalized energy to RGB (0-255)
+        // Use square root for better visual distribution
+        r = Math.floor(Math.sqrt(lowsNorm) * 255);
+        g = Math.floor(Math.sqrt(midsNorm) * 255);
+        b = Math.floor(Math.sqrt(highsNorm) * 255);
+    } else {
+        // Silence - use gray
+        r = g = b = 128;
+    }
+    
+    // Ensure minimum brightness for visibility
+    const minBrightness = 30;
+    if (r < minBrightness && g < minBrightness && b < minBrightness) {
+        r = Math.max(minBrightness, r);
+        g = Math.max(minBrightness, g);
+        b = Math.max(minBrightness, b);
+    }
+    
+    return `rgb(${r}, ${g}, ${b})`;
+}
+
+/**
+ * Get color from circular buffer at a given index (handles wrapping)
+ * @param {number} index - Index in the circular buffer
+ * @returns {string} RGB color string
+ */
+function getBufferColor(index) {
+    // Handle negative indices and wrap around
+    while (index < 0) {
+        index += waveformBufferSize;
+    }
+    index = index % waveformBufferSize;
+    return waveformColorBuffer[index] || 'rgb(128, 128, 128)';
+}
+
+/**
+ * Update waveform buffer with new time-domain data and calculate colors from frequency data
+ * Calculates color based on current FFT data for frequency content representation
  */
 function updateWaveform() {
-    if (!analyser || !timeDomainData || waveformBufferSize === 0) return;
+    if (!analyser || !timeDomainData || waveformBufferSize === 0 || !fftData) return;
     
     // Get time-domain data (raw audio samples) - reuse the same array
-    // This returns the last fftSize samples (32768 samples = ~0.68 seconds at 48kHz)
     analyser.getFloatTimeDomainData(timeDomainData);
     
-    // The time-domain data is a rolling window that updates continuously
-    // We need to identify which samples are new. Since the window rolls forward,
-    // we can estimate new samples by looking at the end of the array
-    // Add samples from the end of the time-domain data (most recent) to the buffer
-    // Only add a reasonable chunk each frame to avoid overwhelming the buffer
+    // Get current frequency data for color calculation
+    analyser.getFloatFrequencyData(fftData);
+    
+    // Calculate color based on current frequency content
+    const color = calculateFrequencyColor(fftData, analyser.fftSize);
     
     // Estimate: at 60fps, we get ~800 new samples per frame at 48kHz
-    // But to be safe and ensure smooth updates, add samples from the last portion
-    const samplesToAdd = Math.min(1024, timeDomainData.length); // Add up to 1024 samples per frame
+    // Add samples from the last portion of time-domain data
+    const samplesToAdd = Math.min(1024, timeDomainData.length);
     const startIdx = Math.max(0, timeDomainData.length - samplesToAdd);
     
-    // Add samples to circular buffer (no downsampling, no averaging)
+    // Add samples and colors to circular buffers
     for (let i = startIdx; i < timeDomainData.length; i++) {
         waveformBuffer[waveformWriteIndex] = timeDomainData[i];
+        waveformColorBuffer[waveformWriteIndex] = color; // Same color for all samples in this frame
         waveformWriteIndex = (waveformWriteIndex + 1) % waveformBufferSize;
     }
 }
@@ -1003,17 +1183,16 @@ function getBufferSample(index) {
 }
 
 /**
- * Draw the oscilloscope waveform with high-resolution interpolation
- * Uses linear interpolation to map circular buffer to canvas pixels without downsampling
+ * Draw the oscilloscope waveform with Rekordbox-style multi-colored visualization
+ * Draws vertical lines/rectangles with colors representing frequency content
  * Shows most recent data on the right, older data on the left
- * View length controls how much history is displayed from the circular buffer
  * @param {CanvasRenderingContext2D} ctx - Canvas rendering context
  * @param {AnalyserNode} analyser - Web Audio AnalyserNode
  * @param {number} canvasWidth - Canvas width in CSS pixels
  * @param {number} canvasHeight - Canvas height in CSS pixels
  */
 function drawOscilloscope(ctx, analyser, canvasWidth, canvasHeight) {
-    if (!ctx || !analyser || waveformBuffer.length === 0) {
+    if (!ctx || !analyser || waveformBuffer.length === 0 || waveformColorBuffer.length === 0) {
         return;
     }
     
@@ -1046,90 +1225,40 @@ function drawOscilloscope(ctx, analyser, canvasWidth, canvasHeight) {
     ctx.lineTo(canvasWidth, centerY);
     ctx.stroke();
     
-    // Build waveform path using linear interpolation
+    // Draw waveform as vertical lines/rectangles with frequency-based colors
     // Most recent data appears on the right, older data scrolls left
     // x=0 (leftmost) = oldest visible data, x=canvasWidth-1 (rightmost) = newest data
-    ctx.beginPath();
-    let firstPoint = true;
     
     for (let x = 0; x < canvasWidth; x++) {
-        // Map canvas X (0 to canvasWidth-1) to buffer index range (oldestBufferIdx to newestBufferIdx)
-        // Linear interpolation: x=0 -> oldestBufferIdx, x=canvasWidth-1 -> newestBufferIdx
+        // Map canvas X to buffer index range
         const normalizedX = canvasWidth > 1 ? x / (canvasWidth - 1) : 0;
         const bufferIdx = oldestBufferIdx + normalizedX * (newestBufferIdx - oldestBufferIdx);
         
-        // Get the two samples to interpolate between
+        // Get sample and color from buffer (use nearest sample for color accuracy)
         const i0 = Math.floor(bufferIdx);
-        const i1 = i0 + 1;
-        const frac = bufferIdx - i0;
-        
-        // Linear interpolation between adjacent samples in circular buffer
-        const sample0 = getBufferSample(i0);
-        const sample1 = getBufferSample(i1);
-        const sample = sample0 * (1 - frac) + sample1 * frac;
+        const sample = getBufferSample(i0);
+        const color = getBufferColor(i0);
         
         // Convert sample (-1 to 1) to Y coordinate
+        // Positive amplitude goes up, negative goes down (symmetric waveform)
         const amplitude = Math.max(-1, Math.min(1, sample));
-        const y = centerY - (amplitude * waveformHeight);
+        const yOffset = amplitude * waveformHeight;
+        const yTop = centerY - yOffset;
+        const yBottom = centerY + yOffset;
         
-        if (firstPoint) {
-            ctx.moveTo(x, y);
-            firstPoint = false;
-        } else {
-            ctx.lineTo(x, y);
-        }
+        // Draw vertical line/rectangle for this pixel column
+        // Use the color from the buffer
+        ctx.fillStyle = color;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        
+        // Draw as a filled vertical rectangle (symmetric around center)
+        // For very small amplitudes, draw at least a 1px line
+        const lineHeight = Math.max(1, Math.abs(yBottom - yTop));
+        const drawY = Math.min(yTop, yBottom);
+        
+        ctx.fillRect(x, drawY, 1, lineHeight);
     }
-    
-    // Draw filled waveform with gradient
-    ctx.lineTo(canvasWidth - 1, centerY);
-    ctx.lineTo(0, centerY);
-    ctx.closePath();
-    
-    // Create gradient fill (left to right: blue -> purple -> red)
-    // Left = older data, Right = newer data
-    const gradient = ctx.createLinearGradient(0, 0, canvasWidth, 0);
-    gradient.addColorStop(0, 'rgba(59, 130, 246, 0.6)');   // blue-500 (left/old)
-    gradient.addColorStop(0.5, 'rgba(168, 85, 247, 0.6)'); // purple-500 (middle)
-    gradient.addColorStop(1, 'rgba(239, 68, 68, 0.6)');     // red-500 (right/new)
-    
-    ctx.fillStyle = gradient;
-    ctx.fill();
-    
-    // Redraw the waveform line on top (for crisp line)
-    ctx.beginPath();
-    firstPoint = true;
-    
-    for (let x = 0; x < canvasWidth; x++) {
-        const normalizedX = canvasWidth > 1 ? x / (canvasWidth - 1) : 0;
-        const bufferIdx = oldestBufferIdx + normalizedX * (newestBufferIdx - oldestBufferIdx);
-        
-        const i0 = Math.floor(bufferIdx);
-        const i1 = i0 + 1;
-        const frac = bufferIdx - i0;
-        
-        const sample0 = getBufferSample(i0);
-        const sample1 = getBufferSample(i1);
-        const sample = sample0 * (1 - frac) + sample1 * frac;
-        const amplitude = Math.max(-1, Math.min(1, sample));
-        const y = centerY - (amplitude * waveformHeight);
-        
-        if (firstPoint) {
-            ctx.moveTo(x, y);
-            firstPoint = false;
-        } else {
-            ctx.lineTo(x, y);
-        }
-    }
-    
-    // Use gradient for line color too (for visual consistency)
-    const lineGradient = ctx.createLinearGradient(0, 0, canvasWidth, 0);
-    lineGradient.addColorStop(0, 'rgba(59, 130, 246, 1)');   // blue-500
-    lineGradient.addColorStop(0.5, 'rgba(168, 85, 247, 1)'); // purple-500
-    lineGradient.addColorStop(1, 'rgba(239, 68, 68, 1)');     // red-500
-    
-    ctx.strokeStyle = lineGradient;
-    ctx.lineWidth = 2;
-    ctx.stroke();
 }
 
 /**
@@ -1464,37 +1593,21 @@ function update() {
         console.warn('FFT data appears to be all NaN. Audio may not be flowing through analyser.');
     }
     
-    // Apply EMA smoothing
+    // Update smoothedData with fixed fast alpha (0.8) for responsive live view
     if (smoothedData) {
-        updateEMA(fftData, smoothedData, emaAlpha);
-        
-        // Debug: Log first few values occasionally
-        if (Math.random() < 0.01) { // Log ~1% of the time
-            const fftArray = Array.from(fftData);
-            const smoothedArray = Array.from(smoothedData);
-            const validFft = fftArray.filter(v => !isNaN(v));
-            const validSmoothed = smoothedArray.filter(v => !isNaN(v));
-            const finiteFft = validFft.filter(v => isFinite(v));
-            const finiteSmoothed = validSmoothed.filter(v => isFinite(v));
-            
-            console.log('FFT data sample:', {
-                fftLength: fftData.length,
-                smoothedLength: smoothedData.length,
-                validFftCount: validFft.length,
-                validSmoothedCount: validSmoothed.length,
-                finiteFftCount: finiteFft.length,
-                finiteSmoothedCount: finiteSmoothed.length,
-                first5: fftArray.slice(0, 5),
-                smoothedFirst5: smoothedArray.slice(0, 5),
-                fftMin: finiteFft.length > 0 ? Math.min(...finiteFft) : (validFft.length > 0 ? 'All -Infinity' : 'N/A'),
-                fftMax: finiteFft.length > 0 ? Math.max(...finiteFft) : (validFft.length > 0 ? 'All -Infinity' : 'N/A'),
-                smoothedMin: finiteSmoothed.length > 0 ? Math.min(...finiteSmoothed) : (validSmoothed.length > 0 ? 'All -Infinity' : 'N/A'),
-                smoothedMax: finiteSmoothed.length > 0 ? Math.max(...finiteSmoothed) : (validSmoothed.length > 0 ? 'All -Infinity' : 'N/A')
-            });
-        }
-    } else {
-        if (Math.random() < 0.01) {
-            console.warn('Update: No smoothedData array available');
+        updateEMA(fftData, smoothedData, SMOOTHED_DATA_ALPHA);
+    }
+    
+    // Update averageData with variable alpha from slider (for long-term average)
+    if (averageData) {
+        // Use a separate initialization flag for averageData
+        if (!averageDataInitialized) {
+            for (let i = 0; i < fftData.length; i++) {
+                averageData[i] = fftData[i];
+            }
+            averageDataInitialized = true;
+        } else {
+            updateEMA(fftData, averageData, averageDataAlpha);
         }
     }
     
@@ -1511,39 +1624,50 @@ function update() {
 }
 
 /**
- * Draw the spectrum with amplitude line and gradient fill
- * @param {Float32Array} smoothed - Smoothed FFT data array
+ * Draw the spectrum with two layers: Live fill (smoothedData) and Average curve (averageData)
+ * @param {Float32Array} smoothed - Smoothed FFT data array (not used directly, kept for compatibility)
  * @param {CanvasRenderingContext2D} ctx - Canvas rendering context
  * @param {number} width - Canvas width
  * @param {number} height - Canvas height
  */
 function drawSpectrum(smoothed, ctx, width, height) {
-    if (!smoothed || smoothed.length === 0 || !audioContext) {
-        console.warn('drawSpectrum: No data to draw', {
-            hasSmoothed: !!smoothed,
-            smoothedLength: smoothed ? smoothed.length : 0,
+    if (!smoothedData || smoothedData.length === 0 || !averageData || averageData.length === 0 || !audioContext) {
+        console.warn('drawSpectrum: No data available', {
+            hasSmoothedData: !!smoothedData,
+            hasAverageData: !!averageData,
             hasAudioContext: !!audioContext
         });
         return;
     }
     
-    const sampleRate = getSampleRate();
-    const binFrequencies = computeBinFrequencies();
+    // Calculate active draw area
+    const activeLeft = MARGIN_LEFT;
+    const activeTop = MARGIN_TOP;
+    const activeRight = width - MARGIN_RIGHT;
+    const activeBottom = height - MARGIN_BOTTOM;
+    const activeWidth = activeRight - activeLeft;
+    const activeHeight = activeBottom - activeTop;
     
-    if (binFrequencies.length === 0) {
-        console.warn('drawSpectrum: No bin frequencies computed');
-        return;
-    }
-    
-    // Build the path for the spectrum line
+    // Save context and set up clipping for active draw area
+    ctx.save();
     ctx.beginPath();
+    ctx.rect(activeLeft, activeTop, activeWidth, activeHeight);
+    ctx.clip();
     
+    // Fill background of active draw area
+    ctx.fillStyle = '#030712'; // gray-950
+    ctx.fillRect(activeLeft, activeTop, activeWidth, activeHeight);
+    
+    // ===== LAYER 1: Live Fill (smoothedData) =====
+    // Draw smoothedData as a filled area with gradient
+    ctx.beginPath();
+    let firstPoint = true;
     let firstX = null;
     let firstY = null;
-    let pointsDrawn = 0;
     
-    for (let i = 0; i < smoothed.length; i++) {
-        const freq = binFrequencies[i];
+    // Build path for smoothedData (live data)
+    for (let i = 0; i < smoothedData.length; i++) {
+        const freq = binFrequency(i, getSampleRate(), smoothedData.length);
         
         // Skip bins outside the frequency range
         if (freq < MIN_FREQ || freq > MAX_FREQ) {
@@ -1551,59 +1675,73 @@ function drawSpectrum(smoothed, ctx, width, height) {
         }
         
         const x = frequencyToX(freq, width);
-        const y = dbToY(smoothed[i], height);
+        const y = dbToY(smoothedData[i], height);
         
-        // Clamp Y to valid drawing area bounds (accounting for padding)
-        const clampedY = Math.max(CANVAS_PADDING_TOP, Math.min(height - CANVAS_PADDING_BOTTOM, y));
+        // Clamp Y to active draw area
+        const clampedY = Math.max(activeTop, Math.min(activeBottom, y));
         
-        if (firstX === null) {
+        if (firstPoint) {
             firstX = x;
             firstY = clampedY;
             ctx.moveTo(x, clampedY);
-            pointsDrawn++;
+            firstPoint = false;
         } else {
             ctx.lineTo(x, clampedY);
-            pointsDrawn++;
         }
     }
     
-    // Debug: Log occasionally
-    if (Math.random() < 0.01) { // Log ~1% of the time
-        console.log('drawSpectrum:', {
-            pointsDrawn: pointsDrawn,
-            firstX: firstX,
-            firstY: firstY,
-            canvasWidth: width,
-            canvasHeight: height,
-            sampleRate: sampleRate
-        });
-    }
-    
-    // Close the path to the bottom corners for gradient fill
+    // Close path for fill (connect to bottom corners)
     if (firstX !== null) {
         const lastX = frequencyToX(MAX_FREQ, width);
-        const bottomY = height - CANVAS_PADDING_BOTTOM;
-        ctx.lineTo(lastX, bottomY); // Bottom right (at drawing area bottom)
-        ctx.lineTo(firstX, bottomY); // Bottom left (at drawing area bottom)
+        ctx.lineTo(lastX, activeBottom);
+        ctx.lineTo(firstX, activeBottom);
         ctx.closePath();
-    } else {
-        return; // No valid data to draw
+        
+        // Create gradient fill (blue to cyan to white) for live data
+        const gradient = ctx.createLinearGradient(0, activeTop, 0, activeBottom);
+        gradient.addColorStop(0, 'rgba(59, 130, 246, 0.6)');   // blue-500
+        gradient.addColorStop(0.5, 'rgba(34, 211, 238, 0.6)');  // cyan-400
+        gradient.addColorStop(1, 'rgba(236, 254, 255, 0.4)');   // cyan-50
+        
+        ctx.fillStyle = gradient;
+        ctx.fill();
     }
     
-    // Create gradient fill (blue to red) - only in the drawing area
-    const gradient = ctx.createLinearGradient(0, CANVAS_PADDING_TOP, 0, height - CANVAS_PADDING_BOTTOM);
-    gradient.addColorStop(0, 'rgba(59, 130, 246, 0.6)');   // blue-500 with transparency
-    gradient.addColorStop(0.5, 'rgba(168, 85, 247, 0.6)'); // purple-500
-    gradient.addColorStop(1, 'rgba(239, 68, 68, 0.6)');     // red-500
+    // ===== LAYER 2: Average Curve (averageData) =====
+    // Draw averageData as a bright line on top
+    ctx.beginPath();
+    firstPoint = true;
     
-    // Fill the area under the curve
-    ctx.fillStyle = gradient;
-    ctx.fill();
+    // Build path for averageData (long-term average)
+    for (let i = 0; i < averageData.length; i++) {
+        const freq = binFrequency(i, getSampleRate(), averageData.length);
+        
+        // Skip bins outside the frequency range
+        if (freq < MIN_FREQ || freq > MAX_FREQ) {
+            continue;
+        }
+        
+        const x = frequencyToX(freq, width);
+        const y = dbToY(averageData[i], height);
+        
+        // Clamp Y to active draw area
+        const clampedY = Math.max(activeTop, Math.min(activeBottom, y));
+        
+        if (firstPoint) {
+            ctx.moveTo(x, clampedY);
+            firstPoint = false;
+        } else {
+            ctx.lineTo(x, clampedY);
+        }
+    }
     
-    // Stroke the line
-    ctx.strokeStyle = '#3b82f6'; // blue-500
+    // Draw the average curve as a bright cyan/white line
+    ctx.strokeStyle = '#67e8f9'; // cyan-300 - bright and visible
     ctx.lineWidth = 2;
     ctx.stroke();
+    
+    // Restore context (removes clipping)
+    ctx.restore();
 }
 
 /**
@@ -1614,22 +1752,29 @@ function drawSpectrum(smoothed, ctx, width, height) {
  */
 function drawFrequencyMarkers(ctx, width, height) {
     const frequencies = [100, 1000, 10000]; // 100 Hz, 1 kHz, 10 kHz
-    const labelY = CANVAS_PADDING_TOP / 2; // Position labels in the top padding area
     
-    ctx.strokeStyle = '#6b7280'; // gray-500
+    // Calculate active draw area boundaries
+    const activeTop = MARGIN_TOP;
+    const activeBottom = height - MARGIN_BOTTOM;
+    const labelY = height - MARGIN_BOTTOM + 15; // Position labels in the bottom margin area
+    
+    // Set up styling for grid lines (subtle, low opacity)
+    ctx.strokeStyle = 'rgba(107, 114, 128, 0.3)'; // gray-500 with low opacity
     ctx.lineWidth = 1;
-    ctx.font = '12px system-ui, -apple-system, sans-serif';
-    ctx.fillStyle = '#d1d5db'; // gray-300
+    
+    // Set up styling for labels
+    ctx.font = '11px system-ui, -apple-system, sans-serif';
+    ctx.fillStyle = '#9ca3af'; // gray-400
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     
     for (const freq of frequencies) {
         const x = frequencyToX(freq, width);
         
-        // Draw vertical line (only in the drawing area, not in padding)
+        // Draw vertical grid line extending only across the active draw area
         ctx.beginPath();
-        ctx.moveTo(x, CANVAS_PADDING_TOP);
-        ctx.lineTo(x, height - CANVAS_PADDING_BOTTOM);
+        ctx.moveTo(x, activeTop);
+        ctx.lineTo(x, activeBottom);
         ctx.stroke();
         
         // Format label
@@ -1640,22 +1785,7 @@ function drawFrequencyMarkers(ctx, width, height) {
             label = `${freq} Hz`;
         }
         
-        // Draw label background for better readability
-        const textMetrics = ctx.measureText(label);
-        const textWidth = textMetrics.width;
-        const textHeight = 14;
-        const padding = 4;
-        
-        ctx.fillStyle = 'rgba(3, 7, 18, 0.8)'; // gray-950 with transparency
-        ctx.fillRect(
-            x - textWidth / 2 - padding,
-            labelY - textHeight / 2 - 1,
-            textWidth + padding * 2,
-            textHeight + 2
-        );
-        
-        // Draw label text
-        ctx.fillStyle = '#d1d5db'; // gray-300
+        // Draw label in the bottom margin area
         ctx.fillText(label, x, labelY);
     }
 }
@@ -1670,10 +1800,17 @@ function drawDbMarkers(ctx, width, height) {
     // dB values to display (from MAX_DB to MIN_DB, top to bottom)
     // Show markers every 10 dB from 0 dB (top) down to -100 dB (bottom)
     const dbValues = [0, -10, -20, -30, -40, -50, -60, -70, -80, -90, -100];
-    const labelX = 8; // Position labels on the left
     
-    ctx.strokeStyle = '#4b5563'; // gray-600 (lighter than frequency markers)
+    // Calculate active draw area boundaries
+    const activeLeft = MARGIN_LEFT;
+    const activeRight = width - MARGIN_RIGHT;
+    const labelX = 8; // Position labels in the left margin area
+    
+    // Set up styling for grid lines (subtle, low opacity)
+    ctx.strokeStyle = 'rgba(75, 85, 99, 0.3)'; // gray-600 with low opacity
     ctx.lineWidth = 0.5;
+    
+    // Set up styling for labels
     ctx.font = '11px system-ui, -apple-system, sans-serif';
     ctx.fillStyle = '#9ca3af'; // gray-400
     ctx.textAlign = 'left';
@@ -1682,31 +1819,16 @@ function drawDbMarkers(ctx, width, height) {
     for (const db of dbValues) {
         const y = dbToY(db, height);
         
-        // Draw horizontal line (from left padding edge to start of drawing area)
+        // Draw horizontal grid line extending only across the active draw area
         ctx.beginPath();
-        ctx.moveTo(CANVAS_PADDING_LEFT - 10, y);
-        ctx.lineTo(CANVAS_PADDING_LEFT, y);
+        ctx.moveTo(activeLeft, y);
+        ctx.lineTo(activeRight, y);
         ctx.stroke();
         
         // Format label
         const label = `${db} dB`;
         
-        // Draw label background for better readability
-        const textMetrics = ctx.measureText(label);
-        const textWidth = textMetrics.width;
-        const textHeight = 12;
-        const padding = 3;
-        
-        ctx.fillStyle = 'rgba(3, 7, 18, 0.7)'; // gray-950 with transparency
-        ctx.fillRect(
-            labelX - 2,
-            y - textHeight / 2 - 1,
-            textWidth + padding,
-            textHeight + 2
-        );
-        
-        // Draw label text
-        ctx.fillStyle = '#9ca3af'; // gray-400
+        // Draw label text in the left margin area
         ctx.fillText(label, labelX, y);
     }
 }
@@ -2012,13 +2134,14 @@ function handleSmoothingChange() {
     // Update display
     smoothingValue.textContent = Math.round(sliderValue);
     
-    // Map slider value (0-100) to alpha (0.1-0.95)
-    // 0% = maximum smoothing (alpha = 0.1, very slow response, very smooth)
-    // 100% = minimal smoothing (alpha = 0.95, very fast response, follows input closely)
-    // This range provides more noticeable smoothing effects
-    emaAlpha = 0.1 + (sliderValue / 100) * 0.85;
+    // Map slider value (0-100) to alpha for averageData (0.05-0.5)
+    // 0% = very slow average (alpha = 0.05, shows long-term average shape)
+    // 100% = faster average (alpha = 0.5, more responsive but still averaged)
+    // Lower alpha = slower update = longer-term average
+    // Higher alpha = faster update = shorter-term average
+    averageDataAlpha = 0.05 + (sliderValue / 100) * 0.45;
     
-    console.log(`Smoothing updated: ${Math.round(sliderValue)}% -> alpha = ${emaAlpha.toFixed(3)}`);
+    console.log(`Average smoothing updated: ${Math.round(sliderValue)}% -> alpha = ${averageDataAlpha.toFixed(3)}`);
 }
 
 /**
@@ -2048,7 +2171,31 @@ function handleDecaySpeedChange() {
     }
 }
 
+// Settings menu toggle
+const settingsTrigger = document.getElementById('settings-trigger');
+const settingsMenu = document.getElementById('settings-menu');
+
+/**
+ * Toggle settings menu visibility
+ */
+function toggleSettingsMenu() {
+    if (settingsMenu) {
+        settingsMenu.classList.toggle('hidden');
+    }
+}
+
 // Event listeners
+if (settingsTrigger) {
+    settingsTrigger.addEventListener('click', toggleSettingsMenu);
+}
+
+// Close settings menu when clicking outside
+document.addEventListener('click', (event) => {
+    if (settingsMenu && settingsTrigger && !settingsMenu.contains(event.target) && !settingsTrigger.contains(event.target)) {
+        settingsMenu.classList.add('hidden');
+    }
+});
+
 playPauseBtn.addEventListener('click', handlePlayPause);
 audioSourceSelect.addEventListener('change', handleAudioSourceChange);
 smoothingSlider.addEventListener('input', handleSmoothingChange);

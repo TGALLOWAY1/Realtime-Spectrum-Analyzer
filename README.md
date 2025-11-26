@@ -23,7 +23,12 @@ A web-based real-time spectrum analyzer for audio visualization.
 
 1. Start a local web server:
    ```bash
-   python3 -m http.server 8000
+   python3 -m http.server 8000 2>/dev/null
+   ```
+   
+   Or to see only important messages (suppress broken pipe errors):
+   ```bash
+   python3 -m http.server 8000 2>&1 | grep -v "BrokenPipeError"
    ```
 
 2. Open in browser:
