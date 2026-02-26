@@ -1,4 +1,5 @@
 export { analyzeSampleToMidi } from './entrypoint.js';
+export { scoreAtonality } from './atonality.js';
 export {
     estimateKeyFromChroma,
     inferChordsFromChroma,

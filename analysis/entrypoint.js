@@ -1,3 +1,4 @@
+import { scoreAtonality } from './atonality.js';
 import { estimateKeyFromChroma, inferChordsFromChroma } from './chords.js';
 import { splitMelodyHarmony } from './melody_harmony_split.js';
 import { preprocessAudio } from './preprocess.js';
@@ -68,10 +69,26 @@ export async function analyzeSampleToMidi(input) {
         }
     }
 
+    if (options.detectAtonal) {
+        const atonality = scoreAtonality({
+            keyEstimate: result.keyEstimate,
+            chords: result.chords,
+            chromaFrames: transcription.chroma,
+            atonalThreshold: options.atonalThreshold || 0.65
+        });
+
+        result.atonalScore = atonality.atonalScore;
+        result.isAtonal = atonality.isAtonal;
+
+        if (result.debug) {
+            result.debug.atonality = atonality.factors;
+        }
+    }
+
     if (result.debug?.warnings) {
         result.debug.warnings.push('Offline transcription pipeline skeleton active.');
         result.debug.warnings.push(...preprocessResult.warnings);
-        result.debug.warnings.push('Atonality scoring and MIDI export are not implemented in this slice.');
+        result.debug.warnings.push('MIDI export is not implemented in this slice.');
     }
 
     if (result.debug) {
