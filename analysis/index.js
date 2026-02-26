@@ -1,4 +1,5 @@
 export { analyzeSampleToMidi } from './entrypoint.js';
+export { splitMelodyHarmony } from './melody_harmony_split.js';
 export { preprocessAudio, normalizePeak, toMono } from './preprocess.js';
 export { transcribeV1 } from './transcription.js';
 export { computeStftFrames, fftInPlace, createHannWindow } from './stft.js';

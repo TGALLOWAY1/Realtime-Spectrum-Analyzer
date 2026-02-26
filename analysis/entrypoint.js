@@ -1,3 +1,4 @@
+import { splitMelodyHarmony } from './melody_harmony_split.js';
 import { preprocessAudio } from './preprocess.js';
 import { transcribeV1 } from './transcription.js';
 import {
@@ -47,10 +48,19 @@ export async function analyzeSampleToMidi(input) {
 
     result.notes = transcription.notes;
 
+    const split = splitMelodyHarmony(transcription.notes, {
+        timeResolutionMs: options.timeResolutionMs,
+        extractMelody: options.extractMelody,
+        extractHarmony: options.extractHarmony
+    });
+
+    result.melodyNotes = split.melodyNotes;
+    result.harmonyNotes = split.harmonyNotes;
+
     if (result.debug?.warnings) {
         result.debug.warnings.push('Offline transcription pipeline skeleton active.');
         result.debug.warnings.push(...preprocessResult.warnings);
-        result.debug.warnings.push('Melody/harmony split, chord inference, and MIDI export are not implemented in this slice.');
+        result.debug.warnings.push('Chord inference and MIDI export are not implemented in this slice.');
     }
 
     if (result.debug) {
