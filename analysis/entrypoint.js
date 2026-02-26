@@ -1,4 +1,5 @@
 import { preprocessAudio } from './preprocess.js';
+import { transcribeV1 } from './transcription.js';
 import {
     createEmptyAnalysisResult,
     mergeAnalysisOptions
@@ -39,10 +40,17 @@ export async function analyzeSampleToMidi(input) {
         doHPSS: options.doHPSS
     });
 
+    const transcription = transcribeV1(preprocessResult.normalizedBuffer, input.sampleRate, {
+        timeResolutionMs: options.timeResolutionMs,
+        minNoteDurationMs: options.minNoteDurationMs
+    });
+
+    result.notes = transcription.notes;
+
     if (result.debug?.warnings) {
         result.debug.warnings.push('Offline transcription pipeline skeleton active.');
         result.debug.warnings.push(...preprocessResult.warnings);
-        result.debug.warnings.push('Transcription, chord inference, and MIDI export are not implemented in this slice.');
+        result.debug.warnings.push('Melody/harmony split, chord inference, and MIDI export are not implemented in this slice.');
     }
 
     if (result.debug) {
@@ -51,6 +59,8 @@ export async function analyzeSampleToMidi(input) {
             normalizedSamples: preprocessResult.normalizedBuffer.length,
             usedHPSS: options.doHPSS
         };
+        result.debug.frameTimesSec = transcription.frameTimesSec;
+        result.debug.chroma = transcription.chroma;
     }
 
     return result;
