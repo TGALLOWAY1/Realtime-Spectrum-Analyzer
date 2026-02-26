@@ -1,3 +1,4 @@
+import { estimateKeyFromChroma, inferChordsFromChroma } from './chords.js';
 import { splitMelodyHarmony } from './melody_harmony_split.js';
 import { preprocessAudio } from './preprocess.js';
 import { transcribeV1 } from './transcription.js';
@@ -57,10 +58,20 @@ export async function analyzeSampleToMidi(input) {
     result.melodyNotes = split.melodyNotes;
     result.harmonyNotes = split.harmonyNotes;
 
+    if (options.inferChords) {
+        const inferred = inferChordsFromChroma(transcription.chroma, transcription.frameTimesSec);
+        result.chords = inferred.chords;
+        result.keyEstimate = estimateKeyFromChroma(transcription.chroma);
+
+        if (result.debug) {
+            result.debug.chordWindowScores = inferred.windowScores;
+        }
+    }
+
     if (result.debug?.warnings) {
         result.debug.warnings.push('Offline transcription pipeline skeleton active.');
         result.debug.warnings.push(...preprocessResult.warnings);
-        result.debug.warnings.push('Chord inference and MIDI export are not implemented in this slice.');
+        result.debug.warnings.push('Atonality scoring and MIDI export are not implemented in this slice.');
     }
 
     if (result.debug) {
