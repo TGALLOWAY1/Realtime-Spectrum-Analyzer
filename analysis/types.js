@@ -62,6 +62,7 @@ export const DEFAULT_ANALYSIS_OPTIONS = Object.freeze({
  * @property {number[][]} [chroma]
  * @property {Array<Record<string, number>>} [chordWindowScores]
  * @property {string[]} [warnings]
+ * @property {{inputSamples: number, normalizedSamples: number, usedHPSS: boolean}} [preprocess]
  */
 
 /**
