@@ -8,6 +8,13 @@ import {
     MIXING_BANDS,
 } from './insights.js';
 
+import {
+    SpectrogramBuffer,
+    MetricHistory,
+    drawSpectrogram,
+    drawMetricOverlay,
+} from './spectrogram.js';
+
 // ============================================================
 // Insight Panel State (Phase 2)
 // Updated at a throttled rate (~10 Hz) from per-frame FFT data.
@@ -21,6 +28,22 @@ let insightState = {
 };
 let lastInsightUpdateTime = 0;
 const INSIGHT_UPDATE_INTERVAL_MS = 100; // ~10 Hz
+
+// ============================================================
+// Spectrogram State (Phase 3)
+// Ring buffers for FFT history + metric traces.
+// Written every animation frame; rendered at frame rate on its own canvas.
+// ============================================================
+const SPECTROGRAM_MAX_FRAMES = 600; // ~10 seconds at 60 fps
+const spectrogramBuffer = new SpectrogramBuffer(SPECTROGRAM_MAX_FRAMES);
+const centroidHistory = new MetricHistory(SPECTROGRAM_MAX_FRAMES);
+const levelHistory = new MetricHistory(SPECTROGRAM_MAX_FRAMES);
+
+// Spectrogram canvas setup (initialized after DOM is ready, see bottom of file)
+let spectrogramCanvas = null;
+let spectrogramCtx = null;
+let spectrogramContainer = null;
+const SPECTROGRAM_ASPECT_RATIO = 800 / 250; // 3.2:1
 
 // Audio context and analysers (shared across all sources)
 let audioContext = null;
@@ -1951,6 +1974,67 @@ function resizeOscilloscopeCanvas() {
     }
 }
 
+// ============================================================
+// Spectrogram wrapper & resize (Phase 3)
+// ============================================================
+
+/**
+ * Draw the spectrogram heatmap + metric overlay onto its dedicated canvas.
+ * Called every animation frame inside draw().
+ */
+function drawSpectrogramWrapper() {
+    if (!spectrogramCtx || !spectrogramCanvas) return;
+
+    const sr = getSampleRate();
+    const fftSz = analyserLeft ? analyserLeft.fftSize : 4096;
+
+    // Get CSS dimensions
+    const dpr = window.devicePixelRatio || 1;
+    let cssWidth = spectrogramCanvas.width / dpr;
+    let cssHeight = spectrogramCanvas.height / dpr;
+    if (spectrogramCanvas.style.width) cssWidth = parseFloat(spectrogramCanvas.style.width);
+    if (spectrogramCanvas.style.height) cssHeight = parseFloat(spectrogramCanvas.style.height);
+
+    // Draw the heatmap
+    drawSpectrogram(spectrogramCtx, spectrogramBuffer, cssWidth, cssHeight, sr, fftSz, {
+        minDb: -100,
+        maxDb: -20,
+    });
+
+    // Draw centroid + level overlay traces on top
+    drawMetricOverlay(spectrogramCtx, centroidHistory, levelHistory, cssWidth, cssHeight, {
+        minDb: -100,
+        maxDb: 0,
+    });
+}
+
+/**
+ * Resize the spectrogram canvas to match its container, with HiDPI support.
+ */
+function resizeSpectrogramCanvas() {
+    if (!spectrogramCanvas || !spectrogramContainer) return;
+
+    const containerWidth = spectrogramContainer.clientWidth;
+    let cssWidth = containerWidth;
+    let cssHeight = containerWidth / SPECTROGRAM_ASPECT_RATIO;
+
+    // Handle devicePixelRatio for HiDPI displays
+    const dpr = window.devicePixelRatio || 1;
+
+    spectrogramCanvas.width = cssWidth * dpr;
+    spectrogramCanvas.height = cssHeight * dpr;
+    spectrogramCanvas.style.width = cssWidth + 'px';
+    spectrogramCanvas.style.height = cssHeight + 'px';
+    spectrogramCanvas.style.maxWidth = '100%';
+
+    spectrogramCtx.setTransform(1, 0, 0, 1, 0, 0);
+    spectrogramCtx.scale(dpr, dpr);
+
+    if (spectrogramBuffer.length > 0) {
+        drawSpectrogramWrapper();
+    }
+}
+
 /**
  * Calculate energy (RMS) for a frequency band from FFT data
  * Uses bin indices (startBin/endBin) if available for efficient computation
@@ -2309,6 +2393,22 @@ function update() {
 
         // Update the DOM insight panel (low frequency — safe)
         updateInsightPanel();
+
+        // Push metric traces for spectrogram overlay
+        centroidHistory.push(insightState.centroid ? insightState.centroid.centroidHz : 0);
+    }
+
+    // ===== Phase 3: Push FFT frame into spectrogram buffer every frame =====
+    if (averageData && analyserLeft) {
+        spectrogramBuffer.push(averageData);
+
+        // Push overall level (mean dB) for the level trace
+        let sum = 0;
+        let cnt = 0;
+        for (let i = 0; i < averageData.length; i++) {
+            if (isFinite(averageData[i])) { sum += averageData[i]; cnt++; }
+        }
+        levelHistory.push(cnt > 0 ? sum / cnt : -Infinity);
     }
 }
 
@@ -2760,6 +2860,9 @@ function draw() {
     
     // Draw oscilloscope (axis is now drawn internally)
     drawOscilloscopeWrapper();
+
+    // Draw spectrogram (Phase 3)
+    drawSpectrogramWrapper();
 }
 
 let frameCount = 0;
@@ -3120,10 +3223,19 @@ handleSmoothingChange();
 
 // Initialize decay speed from slider's initial value
 handleDecaySpeedChange();
-// Initialize canvas size
+// Initialize spectrogram canvas (Phase 3)
+spectrogramCanvas = document.getElementById('spectrogram-canvas');
+spectrogramCtx = spectrogramCanvas ? spectrogramCanvas.getContext('2d') : null;
+spectrogramContainer = spectrogramCanvas ? spectrogramCanvas.parentElement : null;
+
+// Initialize canvas sizes
 resizeCanvas();
 resizeVectorScopeCanvas();
 resizeOscilloscopeCanvas();
+if (spectrogramCanvas && spectrogramCtx) {
+    resizeSpectrogramCanvas();
+    drawSpectrogramWrapper(); // Render empty state placeholder
+}
 
 // Test canvas rendering
 if (ctx && canvas) {
@@ -3194,6 +3306,7 @@ window.addEventListener('resize', () => {
         resizeCanvas();
         resizeVectorScopeCanvas();
         resizeOscilloscopeCanvas();
+        resizeSpectrogramCanvas();
     }, 100); // Debounce resize events
 });
 
