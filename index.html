@@ -23,6 +23,67 @@
                 ></canvas>
             </div>
 
+            <!-- ===== Comparison Toolbar (Phase 4) ===== -->
+            <div class="mb-3 flex items-center gap-3 flex-wrap">
+                <!-- Save Snapshot Button -->
+                <button
+                    id="save-snapshot-btn"
+                    class="bg-rose-600/80 hover:bg-rose-600 text-white text-xs font-semibold px-3 py-1.5 rounded transition-colors focus:outline-none focus:ring-2 focus:ring-rose-400 disabled:opacity-40 disabled:cursor-not-allowed"
+                    disabled
+                    title="Save current spectrum as a reference snapshot"
+                >
+                    Save Snapshot
+                </button>
+
+                <!-- Reference Selector -->
+                <div class="flex items-center gap-2">
+                    <label for="snapshot-select" class="text-[10px] text-gray-500 uppercase tracking-wider font-semibold">Reference:</label>
+                    <select
+                        id="snapshot-select"
+                        class="bg-gray-800 text-gray-200 border border-gray-600 rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-rose-400 min-w-[140px]"
+                    >
+                        <option value="">None</option>
+                    </select>
+                </div>
+
+                <!-- Show Overlay Toggle -->
+                <label class="flex items-center gap-1.5 cursor-pointer select-none">
+                    <input
+                        type="checkbox"
+                        id="overlay-toggle"
+                        class="w-3.5 h-3.5 bg-gray-700 border-gray-600 rounded text-rose-500 focus:ring-2 focus:ring-rose-400"
+                        checked
+                    />
+                    <span class="text-xs text-gray-400">Show Overlay</span>
+                </label>
+
+                <!-- Show Delta Toggle -->
+                <label class="flex items-center gap-1.5 cursor-pointer select-none">
+                    <input
+                        type="checkbox"
+                        id="delta-toggle"
+                        class="w-3.5 h-3.5 bg-gray-700 border-gray-600 rounded text-rose-500 focus:ring-2 focus:ring-rose-400"
+                    />
+                    <span class="text-xs text-gray-400">Show Delta</span>
+                </label>
+
+                <!-- Delete Snapshot Button -->
+                <button
+                    id="delete-snapshot-btn"
+                    class="text-gray-500 hover:text-red-400 text-xs px-2 py-1 rounded transition-colors focus:outline-none disabled:opacity-30 disabled:cursor-not-allowed"
+                    disabled
+                    title="Delete selected snapshot"
+                >
+                    Delete
+                </button>
+
+                <!-- Comparison Summary (appears when reference is active) -->
+                <div id="comparison-summary" class="ml-auto flex items-center gap-3 text-[10px] text-gray-500 hidden">
+                    <span id="comp-brightness" class="font-mono"></span>
+                    <span id="comp-tonal" class="font-mono"></span>
+                </div>
+            </div>
+
             <!-- ===== Insight Panel (Phase 2) ===== -->
             <div class="mb-6 bg-gray-800 rounded-lg p-4 shadow-lg">
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-4">

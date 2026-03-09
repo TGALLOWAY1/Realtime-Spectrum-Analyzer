@@ -15,6 +15,19 @@ import {
     drawMetricOverlay,
 } from './spectrogram.js';
 
+import {
+    createSnapshot,
+    serializeSnapshot,
+    deserializeSnapshot,
+    computeDelta,
+    computeBandDelta,
+    computeInsightDelta,
+    loadSnapshots,
+    saveSnapshot,
+    deleteSnapshot,
+    renameSnapshot,
+} from './snapshot.js';
+
 // ============================================================
 // Insight Panel State (Phase 2)
 // Updated at a throttled rate (~10 Hz) from per-frame FFT data.
@@ -44,6 +57,17 @@ let spectrogramCanvas = null;
 let spectrogramCtx = null;
 let spectrogramContainer = null;
 const SPECTROGRAM_ASPECT_RATIO = 800 / 250; // 3.2:1
+
+// ============================================================
+// Comparison State (Phase 4)
+// Snapshot capture, reference overlay, and delta computation.
+// ============================================================
+let savedSnapshots = [];        // Array of snapshot objects (loaded from localStorage)
+let activeReference = null;     // Currently selected reference snapshot (or null)
+let showOverlay = true;         // Whether to render the reference overlay curve
+let showDelta = false;          // Whether to render the delta fill between live and reference
+let lastDelta = null;           // Cached per-bin delta (Float32Array), recomputed at insight rate
+let lastInsightDelta = null;    // Cached insight-level delta summary
 
 // Audio context and analysers (shared across all sources)
 let audioContext = null;
@@ -1057,7 +1081,7 @@ function setupTestAudio(audioPath) {
     // Update play/pause button state based on audio element
     audioElement.addEventListener('play', () => {
         playPauseBtn.textContent = 'Pause';
-        
+
         // CRITICAL: Resume AudioContext before starting visualization
         // AudioContext starts suspended and needs user interaction to resume
         if (audioContext && audioContext.state === 'suspended') {
@@ -1065,20 +1089,23 @@ function setupTestAudio(audioPath) {
             audioContext.resume().then(() => {
                 console.log('AudioContext resumed, state:', audioContext.state);
                 startVisualization();
+                updateSaveButtonState(); // Phase 4: enable snapshot button
             }).catch(err => {
                 console.error('Failed to resume AudioContext on play:', err);
                 startVisualization(); // Try anyway
+                updateSaveButtonState();
             });
         } else {
             startVisualization();
+            updateSaveButtonState(); // Phase 4: enable snapshot button
         }
     });
-    
+
     audioElement.addEventListener('pause', () => {
         playPauseBtn.textContent = 'Play';
         stopVisualization();
     });
-    
+
     audioElement.addEventListener('ended', () => {
         playPauseBtn.textContent = 'Play';
         stopVisualization();
@@ -1978,6 +2005,166 @@ function resizeOscilloscopeCanvas() {
 // Spectrogram wrapper & resize (Phase 3)
 // ============================================================
 
+// ============================================================
+// Reference Overlay & Delta Rendering (Phase 4)
+// ============================================================
+
+/**
+ * Draw the reference snapshot as a stroked curve on the spectrum chart.
+ * Uses a rose/pink color to distinguish from the live cyan curve.
+ */
+function drawReferenceOverlay(ctx, snapshot, width, height) {
+    if (!snapshot.averageData || snapshot.averageData.length === 0) return;
+
+    const sr = snapshot.sampleRate || getSampleRate();
+    const fftSz = snapshot.fftSize || (analyserLeft ? analyserLeft.fftSize : 4096);
+    const binCount = fftSz / 2;
+    const freqPerBin = sr / fftSz;
+
+    const activeLeft = MARGIN_LEFT;
+    const activeRight = width - MARGIN_RIGHT;
+    const activeTop = MARGIN_TOP;
+    const activeBottom = height - MARGIN_BOTTOM;
+    const activeWidth = activeRight - activeLeft;
+
+    // Build points: map each pixel column to averaged snapshot dB
+    const points = [];
+    for (let px = activeLeft; px < activeRight; px++) {
+        const xNorm = (px - activeLeft) / activeWidth;
+        // Log frequency mapping (matches frequencyToX inverse)
+        const logMin = Math.log10(MIN_FREQ);
+        const logMax = Math.log10(MAX_FREQ);
+        const logF = logMin + xNorm * (logMax - logMin);
+        const freq = Math.pow(10, logF);
+
+        const bin = Math.round(freq / freqPerBin);
+        if (bin < 0 || bin >= snapshot.averageData.length) continue;
+
+        // Average a few neighboring bins for smoothness
+        const halfW = 2;
+        let sum = 0, count = 0;
+        for (let b = Math.max(0, bin - halfW); b <= Math.min(binCount - 1, bin + halfW); b++) {
+            const val = snapshot.averageData[b];
+            if (isFinite(val)) { sum += val; count++; }
+        }
+        if (count === 0) continue;
+
+        const avgDb = sum / count;
+        const y = dbToY(avgDb, height);
+        const clampedY = Math.max(activeTop, Math.min(activeBottom, y));
+        points.push({ x: px, y: clampedY });
+    }
+
+    if (points.length < 2) return;
+
+    // Draw the reference curve
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(activeLeft, activeTop, activeWidth, activeBottom - activeTop);
+    ctx.clip();
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(points[i].x, points[i].y);
+    }
+    ctx.strokeStyle = 'rgba(251, 113, 133, 0.7)'; // rose-400
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 3]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Label
+    ctx.font = '9px system-ui';
+    ctx.fillStyle = 'rgba(251, 113, 133, 0.6)';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    const label = activeReference.label || 'reference';
+    ctx.fillText(label, activeRight - 4, activeTop + 4);
+
+    ctx.restore();
+}
+
+/**
+ * Draw the delta between live and reference as a filled area.
+ * Green fill = live is louder, Red fill = reference was louder.
+ */
+function drawDeltaFill(ctx, delta, width, height) {
+    if (!delta || delta.length === 0 || !averageData) return;
+
+    const sr = getSampleRate();
+    const fftSz = analyserLeft ? analyserLeft.fftSize : 4096;
+    const binCount = fftSz / 2;
+    const freqPerBin = sr / fftSz;
+
+    const activeLeft = MARGIN_LEFT;
+    const activeRight = width - MARGIN_RIGHT;
+    const activeTop = MARGIN_TOP;
+    const activeBottom = height - MARGIN_BOTTOM;
+    const activeWidth = activeRight - activeLeft;
+    const activeHeight = activeBottom - activeTop;
+
+    // Map delta to pixel columns
+    const midY = activeTop + activeHeight / 2; // Zero-delta line
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(activeLeft, activeTop, activeWidth, activeHeight);
+    ctx.clip();
+
+    // Draw positive delta (live louder) — green fill above midline
+    // Draw negative delta (ref louder) — red fill below midline
+    // Scale: ±20 dB maps to full half-height
+    const maxDeltaDb = 20;
+
+    for (let px = activeLeft; px < activeRight; px++) {
+        const xNorm = (px - activeLeft) / activeWidth;
+        const logMin = Math.log10(MIN_FREQ);
+        const logMax = Math.log10(MAX_FREQ);
+        const logF = logMin + xNorm * (logMax - logMin);
+        const freq = Math.pow(10, logF);
+
+        const bin = Math.round(freq / freqPerBin);
+        if (bin < 0 || bin >= delta.length) continue;
+
+        const d = delta[bin];
+        if (!isFinite(d) || Math.abs(d) < 0.5) continue;
+
+        // Map delta to pixel height: ±maxDeltaDb → ±halfHeight
+        const norm = Math.max(-1, Math.min(1, d / maxDeltaDb));
+        const barHeight = Math.abs(norm) * (activeHeight / 2);
+
+        if (d > 0) {
+            // Live louder → green bar going up from midline
+            ctx.fillStyle = 'rgba(74, 222, 128, 0.25)'; // green-400
+            ctx.fillRect(px, midY - barHeight, 1, barHeight);
+        } else {
+            // Reference louder → red bar going down from midline
+            ctx.fillStyle = 'rgba(248, 113, 133, 0.25)'; // rose-400
+            ctx.fillRect(px, midY, 1, barHeight);
+        }
+    }
+
+    // Draw zero line
+    ctx.strokeStyle = 'rgba(156, 163, 175, 0.3)'; // gray-400
+    ctx.lineWidth = 0.5;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(activeLeft, midY);
+    ctx.lineTo(activeRight, midY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Delta label
+    ctx.font = '9px system-ui';
+    ctx.fillStyle = 'rgba(156, 163, 175, 0.5)';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('Δ delta', activeLeft + 4, activeTop + 4);
+
+    ctx.restore();
+}
+
 /**
  * Draw the spectrogram heatmap + metric overlay onto its dedicated canvas.
  * Called every animation frame inside draw().
@@ -2394,6 +2581,18 @@ function update() {
         // Update the DOM insight panel (low frequency — safe)
         updateInsightPanel();
 
+        // Phase 4: Recompute delta against active reference at insight rate
+        if (activeReference && averageData) {
+            lastDelta = computeDelta(averageData, activeReference.averageData);
+            if (activeReference.insights) {
+                lastInsightDelta = computeInsightDelta(insightState, activeReference.insights);
+                updateComparisonSummary();
+            }
+        } else {
+            lastDelta = null;
+            lastInsightDelta = null;
+        }
+
         // Push metric traces for spectrogram overlay
         centroidHistory.push(insightState.centroid ? insightState.centroid.centroidHz : 0);
     }
@@ -2527,9 +2726,19 @@ function drawSpectrum(smoothed, ctx, width, height) {
         ctx.stroke();
     }
 
-    // Restore context (removes clipping) — layers 3 & 4 draw AFTER restore
+    // Restore context (removes clipping) — layers 3+ draw AFTER restore
     // so peak labels and centroid label are not clipped at active-area edges.
     ctx.restore();
+
+    // ===== LAYER 2.5: Reference Snapshot Overlay (Phase 4) =====
+    if (activeReference && showOverlay && activeReference.averageData) {
+        drawReferenceOverlay(ctx, activeReference, width, height);
+    }
+
+    // ===== LAYER 2.6: Delta Fill (Phase 4) =====
+    if (activeReference && showDelta && lastDelta) {
+        drawDeltaFill(ctx, lastDelta, width, height);
+    }
 
     // ===== LAYER 3: Peak Markers (Phase 2) =====
     if (insightState.peaks && insightState.peaks.length > 0) {
@@ -3220,6 +3429,202 @@ if (monoScopeCheck) {
 
 // Initialize alpha from slider's initial value
 handleSmoothingChange();
+
+// ============================================================
+// Phase 4: Comparison Workflow — UI Wiring
+// ============================================================
+
+const saveSnapshotBtn = document.getElementById('save-snapshot-btn');
+const snapshotSelect = document.getElementById('snapshot-select');
+const overlayToggle = document.getElementById('overlay-toggle');
+const deltaToggle = document.getElementById('delta-toggle');
+const deleteSnapshotBtn = document.getElementById('delete-snapshot-btn');
+const comparisonSummary = document.getElementById('comparison-summary');
+const compBrightness = document.getElementById('comp-brightness');
+const compTonal = document.getElementById('comp-tonal');
+
+/**
+ * Load saved snapshots from localStorage and populate the reference dropdown.
+ */
+function initSnapshots() {
+    savedSnapshots = loadSnapshots();
+    rebuildSnapshotSelect();
+    // Enable/disable save button based on audio state
+    updateSaveButtonState();
+}
+
+/**
+ * Rebuild the snapshot select dropdown from savedSnapshots array.
+ */
+function rebuildSnapshotSelect() {
+    if (!snapshotSelect) return;
+
+    const currentId = activeReference ? activeReference.id : '';
+    snapshotSelect.innerHTML = '<option value="">None</option>';
+
+    for (const snap of savedSnapshots) {
+        const opt = document.createElement('option');
+        opt.value = snap.id;
+        opt.textContent = snap.label || `Snap ${new Date(snap.timestamp).toLocaleTimeString()}`;
+        snapshotSelect.appendChild(opt);
+    }
+
+    // Restore selection if the active reference still exists
+    if (currentId) {
+        snapshotSelect.value = currentId;
+    }
+}
+
+/**
+ * Enable the Save Snapshot button only when audio is playing and data is available.
+ */
+function updateSaveButtonState() {
+    if (saveSnapshotBtn) {
+        const hasData = averageData && averageData.length > 0 && audioContext;
+        saveSnapshotBtn.disabled = !hasData;
+    }
+    if (deleteSnapshotBtn) {
+        deleteSnapshotBtn.disabled = !activeReference;
+    }
+}
+
+/**
+ * Handle the Save Snapshot button click.
+ */
+function handleSaveSnapshot() {
+    if (!averageData || averageData.length === 0 || !audioContext || !analyserLeft) {
+        return;
+    }
+
+    try {
+        const snapshot = createSnapshot({
+            averageData,
+            smoothedData,
+            fftSize: analyserLeft.fftSize,
+            sampleRate: audioContext.sampleRate,
+            insightState,
+            audioSource: audioSourceSelect ? audioSourceSelect.value : '',
+        });
+
+        if (saveSnapshot(snapshot)) {
+            // Reload saved list and auto-select the new snapshot
+            savedSnapshots = loadSnapshots();
+            rebuildSnapshotSelect();
+            snapshotSelect.value = snapshot.id;
+            handleSnapshotSelect();
+
+            // Flash button for feedback
+            saveSnapshotBtn.textContent = 'Saved!';
+            saveSnapshotBtn.classList.add('bg-green-600/80');
+            saveSnapshotBtn.classList.remove('bg-rose-600/80');
+            setTimeout(() => {
+                saveSnapshotBtn.textContent = 'Save Snapshot';
+                saveSnapshotBtn.classList.remove('bg-green-600/80');
+                saveSnapshotBtn.classList.add('bg-rose-600/80');
+            }, 1000);
+        }
+    } catch (err) {
+        console.warn('Failed to save snapshot:', err);
+    }
+}
+
+/**
+ * Handle reference snapshot selection from dropdown.
+ */
+function handleSnapshotSelect() {
+    if (!snapshotSelect) return;
+
+    const selectedId = snapshotSelect.value;
+    if (!selectedId) {
+        activeReference = null;
+        lastDelta = null;
+        lastInsightDelta = null;
+        hideComparisonSummary();
+    } else {
+        activeReference = savedSnapshots.find(s => s.id === selectedId) || null;
+        if (!activeReference) {
+            hideComparisonSummary();
+        }
+    }
+    updateSaveButtonState();
+}
+
+/**
+ * Handle delete snapshot button click.
+ */
+function handleDeleteSnapshot() {
+    if (!activeReference) return;
+
+    const id = activeReference.id;
+    if (deleteSnapshot(id)) {
+        activeReference = null;
+        lastDelta = null;
+        lastInsightDelta = null;
+        savedSnapshots = loadSnapshots();
+        rebuildSnapshotSelect();
+        hideComparisonSummary();
+        updateSaveButtonState();
+    }
+}
+
+/**
+ * Update the comparison summary bar with live delta info.
+ */
+function updateComparisonSummary() {
+    if (!comparisonSummary || !lastInsightDelta) {
+        hideComparisonSummary();
+        return;
+    }
+
+    comparisonSummary.classList.remove('hidden');
+
+    if (compBrightness && lastInsightDelta.centroid) {
+        compBrightness.textContent = lastInsightDelta.centroid.label;
+    }
+
+    if (compTonal) {
+        const live = lastInsightDelta.liveTonal || '—';
+        const ref = lastInsightDelta.refTonal || '—';
+        if (live === ref) {
+            compTonal.textContent = `Both: ${live}`;
+        } else {
+            compTonal.textContent = `${live} vs ${ref}`;
+        }
+    }
+}
+
+/**
+ * Hide the comparison summary.
+ */
+function hideComparisonSummary() {
+    if (comparisonSummary) {
+        comparisonSummary.classList.add('hidden');
+    }
+}
+
+// Wire event listeners
+if (saveSnapshotBtn) {
+    saveSnapshotBtn.addEventListener('click', handleSaveSnapshot);
+}
+if (snapshotSelect) {
+    snapshotSelect.addEventListener('change', handleSnapshotSelect);
+}
+if (overlayToggle) {
+    overlayToggle.addEventListener('change', (e) => {
+        showOverlay = e.target.checked;
+    });
+}
+if (deltaToggle) {
+    deltaToggle.addEventListener('change', (e) => {
+        showDelta = e.target.checked;
+    });
+}
+if (deleteSnapshotBtn) {
+    deleteSnapshotBtn.addEventListener('click', handleDeleteSnapshot);
+}
+
+// Load saved snapshots on startup
+initSnapshots();
 
 // Initialize decay speed from slider's initial value
 handleDecaySpeedChange();
