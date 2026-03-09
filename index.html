@@ -23,6 +23,105 @@
                 ></canvas>
             </div>
 
+            <!-- ===== Insight Panel (Phase 2) ===== -->
+            <div class="mb-6 bg-gray-800 rounded-lg p-4 shadow-lg">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+
+                    <!-- Column 1: Band Energy Summary -->
+                    <div class="flex flex-col gap-2">
+                        <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1">Band Energy</h3>
+                        <div id="band-energy-bars" class="flex flex-col gap-1.5">
+                            <!-- Sub -->
+                            <div class="flex items-center gap-2">
+                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Sub</span>
+                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
+                                    <div id="band-bar-0" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#6366f1"></div>
+                                </div>
+                                <span id="band-val-0" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
+                            </div>
+                            <!-- Bass -->
+                            <div class="flex items-center gap-2">
+                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Bass</span>
+                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
+                                    <div id="band-bar-1" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#3b82f6"></div>
+                                </div>
+                                <span id="band-val-1" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
+                            </div>
+                            <!-- Low Mid -->
+                            <div class="flex items-center gap-2">
+                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Lo Mid</span>
+                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
+                                    <div id="band-bar-2" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#14b8a6"></div>
+                                </div>
+                                <span id="band-val-2" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
+                            </div>
+                            <!-- Mid -->
+                            <div class="flex items-center gap-2">
+                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Mid</span>
+                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
+                                    <div id="band-bar-3" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#eab308"></div>
+                                </div>
+                                <span id="band-val-3" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
+                            </div>
+                            <!-- Hi Mid -->
+                            <div class="flex items-center gap-2">
+                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Hi Mid</span>
+                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
+                                    <div id="band-bar-4" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#f97316"></div>
+                                </div>
+                                <span id="band-val-4" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
+                            </div>
+                            <!-- Air -->
+                            <div class="flex items-center gap-2">
+                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Air</span>
+                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
+                                    <div id="band-bar-5" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#ef4444"></div>
+                                </div>
+                                <span id="band-val-5" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Column 2: Brightness / Centroid + Tonal Descriptor -->
+                    <div class="flex flex-col gap-3">
+                        <!-- Brightness Indicator -->
+                        <div class="flex flex-col gap-1.5">
+                            <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider">Brightness</h3>
+                            <div class="flex items-baseline gap-2">
+                                <span id="centroid-freq" class="text-lg font-semibold text-violet-400 font-mono">—</span>
+                                <span id="centroid-label" class="text-xs text-gray-400">—</span>
+                            </div>
+                            <!-- Centroid position indicator (slider-style) -->
+                            <div class="relative h-2 bg-gray-950 rounded-full overflow-visible mt-1">
+                                <!-- Track gradient: dark → bright -->
+                                <div class="absolute inset-0 rounded-full" style="background: linear-gradient(to right, #6366f1, #14b8a6, #eab308, #f97316, #ef4444); opacity: 0.35;"></div>
+                                <!-- Indicator dot -->
+                                <div id="centroid-bar" class="absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full bg-violet-400 border border-violet-300 shadow-sm shadow-violet-500/50 transition-[left] duration-100" style="left:50%"></div>
+                            </div>
+                            <div class="flex justify-between text-[9px] text-gray-600 mt-0.5">
+                                <span>Dark</span>
+                                <span>Bright</span>
+                            </div>
+                        </div>
+
+                        <!-- Tonal Descriptor -->
+                        <div class="flex flex-col gap-1">
+                            <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider">Tonal Character</h3>
+                            <span id="tonal-descriptor" class="text-sm font-medium text-cyan-300">—</span>
+                        </div>
+                    </div>
+
+                    <!-- Column 3: Detected Peaks -->
+                    <div class="flex flex-col gap-1.5">
+                        <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1">Detected Peaks</h3>
+                        <div id="peak-list" class="flex flex-wrap gap-1.5">
+                            <span class="text-gray-500 text-xs">Press Play to analyze</span>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
             <!-- Multi-Band Vector Scope Section -->
             <div class="mb-6 bg-gray-800 rounded-lg p-4 shadow-lg">
                 <div class="flex gap-4">

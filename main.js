@@ -1,3 +1,26 @@
+import {
+    computeBandEnergies,
+    computeSpectralCentroid,
+    detectPeaks,
+    deriveTonalDescriptor,
+    formatFrequency,
+    formatDb,
+    MIXING_BANDS,
+} from './insights.js';
+
+// ============================================================
+// Insight Panel State (Phase 2)
+// Updated at a throttled rate (~10 Hz) from per-frame FFT data.
+// Kept separate from high-frequency animation state.
+// ============================================================
+let insightState = {
+    bandEnergies: [],       // from computeBandEnergies
+    centroid: null,         // from computeSpectralCentroid
+    peaks: [],              // from detectPeaks
+    tonalDescriptor: '—',   // from deriveTonalDescriptor
+};
+let lastInsightUpdateTime = 0;
+const INSIGHT_UPDATE_INTERVAL_MS = 100; // ~10 Hz
 
 // Audio context and analysers (shared across all sources)
 let audioContext = null;
@@ -2271,6 +2294,22 @@ function update() {
             updateBandStates(smoothedData, binFrequencies);
         }
     }
+
+    // ===== Phase 2: Update insight metrics at a throttled rate =====
+    const now = performance.now();
+    if (now - lastInsightUpdateTime >= INSIGHT_UPDATE_INTERVAL_MS && averageData && audioContext && analyserLeft) {
+        lastInsightUpdateTime = now;
+        const sr = getSampleRate();
+        const fftSz = analyserLeft.fftSize;
+
+        insightState.bandEnergies = computeBandEnergies(averageData, sr, fftSz);
+        insightState.centroid = computeSpectralCentroid(averageData, sr, fftSz);
+        insightState.peaks = detectPeaks(smoothedData, sr, fftSz, { maxPeaks: 5, minProminence: 6, minDb: -70 });
+        insightState.tonalDescriptor = deriveTonalDescriptor(insightState.bandEnergies, insightState.centroid);
+
+        // Update the DOM insight panel (low frequency — safe)
+        updateInsightPanel();
+    }
 }
 
 /**
@@ -2387,9 +2426,98 @@ function drawSpectrum(smoothed, ctx, width, height) {
         ctx.lineWidth = 2;
         ctx.stroke();
     }
-    
-    // Restore context (removes clipping)
+
+    // Restore context (removes clipping) — layers 3 & 4 draw AFTER restore
+    // so peak labels and centroid label are not clipped at active-area edges.
     ctx.restore();
+
+    // ===== LAYER 3: Peak Markers (Phase 2) =====
+    if (insightState.peaks && insightState.peaks.length > 0) {
+        ctx.save();
+        ctx.font = '10px system-ui, -apple-system, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+
+        for (const peak of insightState.peaks) {
+            const px = frequencyToX(peak.freq, width);
+            const py = dbToY(peak.db, height);
+            const clampedPy = Math.max(activeTop + 14, Math.min(activeBottom, py));
+
+            // Skip if marker would be outside active area
+            if (px < activeLeft || px > activeRight) continue;
+
+            // Draw small diamond marker
+            const markerSize = 4;
+            ctx.fillStyle = '#fbbf24'; // amber-400
+            ctx.beginPath();
+            ctx.moveTo(px, clampedPy - markerSize);
+            ctx.lineTo(px + markerSize, clampedPy);
+            ctx.lineTo(px, clampedPy + markerSize);
+            ctx.lineTo(px - markerSize, clampedPy);
+            ctx.closePath();
+            ctx.fill();
+
+            // Draw vertical dashed line from marker down to the bottom
+            ctx.strokeStyle = 'rgba(251, 191, 36, 0.25)'; // amber-400 low opacity
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 4]);
+            ctx.beginPath();
+            ctx.moveTo(px, clampedPy + markerSize);
+            ctx.lineTo(px, activeBottom);
+            ctx.stroke();
+            ctx.setLineDash([]); // reset dash
+
+            // Draw label above marker with background
+            const label = peak.label;
+            const labelMetrics = ctx.measureText(label);
+            const labelWidth = labelMetrics.width + 6;
+            const labelHeight = 13;
+            const labelY = clampedPy - markerSize - 2;
+
+            // Clamp label X to stay within canvas (not just active area)
+            let labelCenterX = px;
+            if (labelCenterX - labelWidth / 2 < 2) {
+                labelCenterX = 2 + labelWidth / 2;
+            } else if (labelCenterX + labelWidth / 2 > width - 2) {
+                labelCenterX = width - 2 - labelWidth / 2;
+            }
+
+            // Label background
+            ctx.fillStyle = 'rgba(3, 7, 18, 0.85)'; // dark bg
+            ctx.fillRect(labelCenterX - labelWidth / 2, labelY - labelHeight, labelWidth, labelHeight);
+
+            // Label text
+            ctx.fillStyle = '#fbbf24'; // amber-400
+            ctx.fillText(label, labelCenterX, labelY - 1);
+        }
+        ctx.restore();
+    }
+
+    // ===== LAYER 4: Spectral Centroid Indicator Line =====
+    if (insightState.centroid && insightState.centroid.centroidHz > 20) {
+        ctx.save();
+        const cx = frequencyToX(insightState.centroid.centroidHz, width);
+
+        // Only draw if centroid is within the active area
+        if (cx >= activeLeft && cx <= activeRight) {
+            ctx.strokeStyle = 'rgba(167, 139, 250, 0.6)'; // violet-400
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([6, 4]);
+            ctx.beginPath();
+            ctx.moveTo(cx, activeTop);
+            ctx.lineTo(cx, activeBottom);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Small label at top — allowed to extend slightly outside active area
+            ctx.font = '9px system-ui, -apple-system, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            ctx.fillStyle = '#a78bfa'; // violet-400
+            ctx.fillText('centroid', cx, activeTop + 2);
+        }
+        ctx.restore();
+    }
 }
 
 /**
@@ -2820,6 +2948,72 @@ function handleAudioSourceChange() {
     
     // Update button text
     playPauseBtn.textContent = 'Play';
+}
+
+// ============================================================
+// Insight Panel DOM Update (Phase 2)
+// Called at ~10 Hz from update() — safe to touch DOM here.
+// ============================================================
+
+/**
+ * Update the insight panel DOM elements with current metric values.
+ * This is called at a throttled rate (~10 Hz), not every animation frame.
+ */
+function updateInsightPanel() {
+    // ===== Band Energy Bars =====
+    const { bandEnergies, centroid, peaks, tonalDescriptor } = insightState;
+
+    for (let i = 0; i < bandEnergies.length; i++) {
+        const band = bandEnergies[i];
+        const barEl = document.getElementById(`band-bar-${i}`);
+        const valEl = document.getElementById(`band-val-${i}`);
+        if (barEl) {
+            barEl.style.width = `${(band.energyNorm * 100).toFixed(1)}%`;
+        }
+        if (valEl) {
+            // Clamp display to -100 dB floor
+            if (isFinite(band.energyDb) && band.energyDb >= -100) {
+                valEl.textContent = `${band.energyDb.toFixed(1)}`;
+            } else {
+                valEl.textContent = '—';
+            }
+        }
+    }
+
+    // ===== Spectral Centroid / Brightness =====
+    const centroidFreqEl = document.getElementById('centroid-freq');
+    const centroidLabelEl = document.getElementById('centroid-label');
+    const centroidBarEl = document.getElementById('centroid-bar');
+    if (centroidFreqEl && centroid) {
+        centroidFreqEl.textContent = centroid.centroidHz > 0 ? formatFrequency(centroid.centroidHz) : '—';
+    }
+    if (centroidLabelEl && centroid) {
+        centroidLabelEl.textContent = centroid.brightnessLabel;
+    }
+    if (centroidBarEl && centroid) {
+        centroidBarEl.style.left = `${(centroid.centroidNorm * 100).toFixed(1)}%`;
+    }
+
+    // ===== Peak List =====
+    const peakListEl = document.getElementById('peak-list');
+    if (peakListEl) {
+        if (peaks.length === 0) {
+            peakListEl.innerHTML = '<span class="text-gray-500 text-xs">No prominent peaks</span>';
+        } else {
+            peakListEl.innerHTML = peaks.map(p =>
+                `<span class="inline-flex items-center gap-1 text-xs bg-gray-800 border border-gray-700 rounded px-1.5 py-0.5">` +
+                `<span class="text-amber-400 font-medium">${p.label}</span>` +
+                `<span class="text-gray-400">${formatDb(p.db)}</span>` +
+                `</span>`
+            ).join(' ');
+        }
+    }
+
+    // ===== Tonal Descriptor =====
+    const tonalEl = document.getElementById('tonal-descriptor');
+    if (tonalEl) {
+        tonalEl.textContent = tonalDescriptor;
+    }
 }
 
 /**
