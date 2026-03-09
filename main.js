@@ -1,4 +1,3 @@
-import { analyzeSampleToMidi, exportToMidi } from './analysis/index.js';
 
 // Audio context and analysers (shared across all sources)
 let audioContext = null;
@@ -75,26 +74,10 @@ const decaySpeedSlider = document.getElementById('decay-speed-slider');
 const decaySpeedValue = document.getElementById('decay-speed-value');
 const fftSizeSelect = document.getElementById('fft-size-select');
 const monoScopeCheck = document.getElementById('mono-scope-check');
-const analyzeSampleBtn = document.getElementById('analyze-sample-btn');
-const cancelAnalysisBtn = document.getElementById('cancel-analysis-btn');
-const exportMidiBtn = document.getElementById('export-midi-btn');
-const analysisStatus = document.getElementById('analysis-status');
-const analysisOptMelody = document.getElementById('analysis-opt-melody');
-const analysisOptChords = document.getElementById('analysis-opt-chords');
-const analysisOptHPSS = document.getElementById('analysis-opt-hpss');
-const analysisOptAtonal = document.getElementById('analysis-opt-atonal');
-const analysisKeyEstimate = document.getElementById('analysis-key-estimate');
-const analysisAtonalBadge = document.getElementById('analysis-atonal-badge');
-const analysisChordTimeline = document.getElementById('analysis-chord-timeline');
-const analysisPianoRoll = document.getElementById('analysis-pianoroll');
 
 // Hardcoded BPM
 const HARDCODED_BPM = 140;
 
-// Offline analysis state
-let offlineAnalysisResult = null;
-let analysisRunToken = 0;
-let analysisRunning = false;
 
 // Oscilloscope canvas setup
 const oscilloscopeCanvas = document.getElementById('oscilloscope-canvas');
@@ -140,7 +123,6 @@ const scopeMidCtx = scopeMidCanvas ? scopeMidCanvas.getContext('2d') : null;
 const scopeHighCanvas = document.getElementById('scope-high');
 const scopeHighCtx = scopeHighCanvas ? scopeHighCanvas.getContext('2d') : null;
 const vectorScopeContainer = scopeSubCanvas ? scopeSubCanvas.parentElement?.parentElement : null;
-const VECTOR_SCOPE_ASPECT_RATIO = 1.2; // 300x250 = 1.2:1 (approximate)
 
 // Band Visualizer configuration
 const BAND_COUNT = 17;
@@ -2182,15 +2164,14 @@ function drawScope(ctx, leftData, rightData, width, height, color) {
 function resizeVectorScopeCanvas() {
     if (!scopeSubCanvas || !scopeLowCanvas || !scopeMidCanvas || !scopeHighCanvas || !vectorScopeContainer) return;
     
-    // Get container dimensions (accounting for gap-4 = 1rem = 16px, 3 gaps = 48px total)
+    // Get container width (accounting for gap-4 = 1rem = 16px, 3 gaps = 48px total)
     const containerWidth = vectorScopeContainer.clientWidth;
-    const containerHeight = vectorScopeContainer.clientHeight;
     
-    // Each canvas gets 1/4 of the width (minus gaps)
+    // Each canvas gets 1/4 of the width (minus gaps), kept square
     const gap = 16; // gap-4 = 1rem = 16px
     const totalGaps = gap * 3; // 3 gaps between 4 canvases
     const canvasWidth = (containerWidth - totalGaps) / 4;
-    const canvasHeight = Math.min(250, containerHeight - 40); // Leave room for labels
+    const canvasHeight = canvasWidth; // Keep scopes square
     
     // Handle devicePixelRatio for HiDPI displays
     const dpr = window.devicePixelRatio || 1;
@@ -2889,294 +2870,7 @@ function handleDecaySpeedChange() {
     }
 }
 
-/**
- * @param {string} message
- * @param {'idle'|'running'|'success'|'error'} state
- */
-function setAnalysisStatus(message, state = 'idle') {
-    if (!analysisStatus) return;
-    analysisStatus.textContent = message;
-    analysisStatus.className = 'text-sm';
-    if (state === 'running') {
-        analysisStatus.classList.add('text-amber-300');
-    } else if (state === 'success') {
-        analysisStatus.classList.add('text-emerald-300');
-    } else if (state === 'error') {
-        analysisStatus.classList.add('text-red-300');
-    } else {
-        analysisStatus.classList.add('text-gray-300');
-    }
-}
 
-/**
- * @param {string} audioPath
- * @returns {string}
- */
-function encodeAudioPath(audioPath) {
-    return audioPath.split('/').map((segment) => encodeURIComponent(segment)).join('/');
-}
-
-/**
- * @param {string} audioPath
- * @returns {Promise<{audioBuffer: Float32Array, sampleRate: number}>}
- */
-async function decodeAudioToMono(audioPath) {
-    const { audioContext: ctx } = initializeAudioContext();
-    const encodedPath = encodeAudioPath(audioPath);
-    let response = await fetch(encodedPath);
-
-    if (!response.ok && audioPath.endsWith('.wav')) {
-        const fallbackPath = encodeAudioPath(audioPath.replace(/\.wav$/i, '.mp3'));
-        response = await fetch(fallbackPath);
-    }
-
-    if (!response.ok) {
-        throw new Error(`Failed to load audio file (${response.status} ${response.statusText})`);
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
-
-    const mono = new Float32Array(decoded.length);
-    const channelCount = decoded.numberOfChannels;
-
-    if (channelCount === 1) {
-        mono.set(decoded.getChannelData(0));
-    } else {
-        for (let channel = 0; channel < channelCount; channel++) {
-            const data = decoded.getChannelData(channel);
-            for (let i = 0; i < decoded.length; i++) {
-                mono[i] += data[i] / channelCount;
-            }
-        }
-    }
-
-    return {
-        audioBuffer: mono,
-        sampleRate: decoded.sampleRate
-    };
-}
-
-/**
- * @returns {import('./analysis/types.js').AnalysisOptions}
- */
-function getOfflineAnalysisOptions() {
-    return {
-        doHPSS: !!analysisOptHPSS?.checked,
-        extractMelody: !!analysisOptMelody?.checked,
-        extractHarmony: true,
-        inferChords: !!analysisOptChords?.checked,
-        detectAtonal: !!analysisOptAtonal?.checked,
-        timeResolutionMs: 30,
-        minNoteDurationMs: 80,
-        atonalThreshold: 0.65
-    };
-}
-
-/**
- * @param {import('./analysis/types.js').AnalysisResult} result
- */
-function renderChordTimeline(result) {
-    if (!analysisChordTimeline) return;
-    analysisChordTimeline.innerHTML = '';
-
-    if (!result.chords.length) {
-        const empty = document.createElement('div');
-        empty.className = 'absolute inset-0 flex items-center justify-center text-xs text-gray-500';
-        empty.textContent = 'No chord events';
-        analysisChordTimeline.appendChild(empty);
-        return;
-    }
-
-    let totalSec = 0;
-    for (let i = 0; i < result.chords.length; i++) {
-        const end = result.chords[i].startSec + result.chords[i].durationSec;
-        if (end > totalSec) totalSec = end;
-    }
-
-    const base = document.createElement('div');
-    base.className = 'absolute inset-0';
-    analysisChordTimeline.appendChild(base);
-
-    for (let i = 0; i < result.chords.length; i++) {
-        const chord = result.chords[i];
-        const left = (chord.startSec / totalSec) * 100;
-        const width = Math.max(3, (chord.durationSec / totalSec) * 100);
-        const lane = i % 2;
-        const pill = document.createElement('div');
-        pill.className = 'absolute px-2 py-0.5 rounded text-[10px] leading-tight bg-indigo-500/70 text-indigo-50 border border-indigo-300/40 truncate';
-        pill.style.left = `${left}%`;
-        pill.style.width = `${width}%`;
-        pill.style.top = lane === 0 ? '8px' : '34px';
-        pill.textContent = chord.label;
-        base.appendChild(pill);
-    }
-}
-
-/**
- * @param {import('./analysis/types.js').AnalysisResult} result
- */
-function renderPianoRoll(result) {
-    if (!analysisPianoRoll) return;
-    const rollCtx = analysisPianoRoll.getContext('2d');
-    if (!rollCtx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const width = analysisPianoRoll.clientWidth || 800;
-    const height = 180;
-    analysisPianoRoll.width = Math.round(width * dpr);
-    analysisPianoRoll.height = Math.round(height * dpr);
-    analysisPianoRoll.style.height = `${height}px`;
-    rollCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    rollCtx.fillStyle = '#030712';
-    rollCtx.fillRect(0, 0, width, height);
-
-    const notes = result.notes;
-    if (!notes.length) {
-        rollCtx.fillStyle = '#6b7280';
-        rollCtx.font = '12px system-ui';
-        rollCtx.textAlign = 'center';
-        rollCtx.fillText('No note events', width / 2, height / 2);
-        return;
-    }
-
-    let minPitch = 127;
-    let maxPitch = 0;
-    let totalSec = 0;
-
-    for (let i = 0; i < notes.length; i++) {
-        const note = notes[i];
-        if (note.pitchMidi < minPitch) minPitch = note.pitchMidi;
-        if (note.pitchMidi > maxPitch) maxPitch = note.pitchMidi;
-        const end = note.startSec + note.durationSec;
-        if (end > totalSec) totalSec = end;
-    }
-
-    const pitchRange = Math.max(1, maxPitch - minPitch + 1);
-
-    for (let i = 0; i < notes.length; i++) {
-        const note = notes[i];
-        const x = (note.startSec / totalSec) * width;
-        const w = Math.max(1, (note.durationSec / totalSec) * width);
-        const yRatio = (note.pitchMidi - minPitch) / pitchRange;
-        const y = height - (yRatio * (height - 12)) - 10;
-        const isMelody = result.melodyNotes.includes(note);
-        rollCtx.fillStyle = isMelody ? 'rgba(16,185,129,0.85)' : 'rgba(59,130,246,0.7)';
-        rollCtx.fillRect(x, y, w, 6);
-    }
-}
-
-/**
- * @param {import('./analysis/types.js').AnalysisResult} result
- */
-function renderAnalysisSummary(result) {
-    if (analysisKeyEstimate) {
-        analysisKeyEstimate.textContent = result.keyEstimate
-            ? `Key: ${result.keyEstimate.label} (${Math.round(result.keyEstimate.confidence * 100)}%)`
-            : 'Key: No stable key';
-    }
-
-    if (analysisAtonalBadge) {
-        analysisAtonalBadge.textContent = result.isAtonal
-            ? `Atonality: Atonal (${result.atonalScore.toFixed(2)})`
-            : `Atonality: Tonal (${result.atonalScore.toFixed(2)})`;
-        analysisAtonalBadge.className = result.isAtonal
-            ? 'text-red-300'
-            : 'text-emerald-300';
-    }
-
-    renderChordTimeline(result);
-    renderPianoRoll(result);
-}
-
-async function handleAnalyzeSample() {
-    if (!audioSourceSelect?.value) {
-        setAnalysisStatus('Select an audio source first.', 'error');
-        return;
-    }
-
-    const runToken = ++analysisRunToken;
-    analysisRunning = true;
-    offlineAnalysisResult = null;
-
-    if (analyzeSampleBtn) analyzeSampleBtn.disabled = true;
-    if (cancelAnalysisBtn) cancelAnalysisBtn.disabled = false;
-    if (exportMidiBtn) exportMidiBtn.disabled = true;
-
-    try {
-        setAnalysisStatus('Decoding audio sample...', 'running');
-        const decoded = await decodeAudioToMono(audioSourceSelect.value);
-
-        if (runToken !== analysisRunToken) {
-            return;
-        }
-
-        setAnalysisStatus('Running offline analysis...', 'running');
-        const result = await analyzeSampleToMidi({
-            audioBuffer: decoded.audioBuffer,
-            sampleRate: decoded.sampleRate,
-            options: getOfflineAnalysisOptions()
-        });
-
-        if (runToken !== analysisRunToken) {
-            return;
-        }
-
-        offlineAnalysisResult = result;
-        renderAnalysisSummary(result);
-        setAnalysisStatus('Analysis complete.', 'success');
-        if (exportMidiBtn) exportMidiBtn.disabled = false;
-    } catch (error) {
-        console.error('Offline analysis failed:', error);
-        setAnalysisStatus(`Analysis failed: ${error.message || 'Unknown error'}`, 'error');
-    } finally {
-        if (runToken === analysisRunToken) {
-            analysisRunning = false;
-            if (analyzeSampleBtn) analyzeSampleBtn.disabled = false;
-            if (cancelAnalysisBtn) cancelAnalysisBtn.disabled = true;
-        }
-    }
-}
-
-function handleCancelAnalysis() {
-    if (!analysisRunning) return;
-    analysisRunToken += 1;
-    analysisRunning = false;
-    setAnalysisStatus('Analysis canceled.', 'idle');
-    if (analyzeSampleBtn) analyzeSampleBtn.disabled = false;
-    if (cancelAnalysisBtn) cancelAnalysisBtn.disabled = true;
-}
-
-function handleExportMidi() {
-    if (!offlineAnalysisResult) {
-        setAnalysisStatus('No analysis result to export.', 'error');
-        return;
-    }
-
-    try {
-        const bytes = exportToMidi(offlineAnalysisResult, {
-            includeMelody: !!analysisOptMelody?.checked,
-            includeChords: !!analysisOptChords?.checked,
-            tempoBpm: 120,
-            ppq: 480,
-            chordBaseOctave: 4
-        });
-
-        const blob = new Blob([bytes], { type: 'audio/midi' });
-        const url = URL.createObjectURL(blob);
-        const download = document.createElement('a');
-        const sourceName = audioSourceSelect?.value?.split('/').pop()?.replace(/\.[^/.]+$/, '') || 'analysis';
-        download.href = url;
-        download.download = `${sourceName}_analysis.mid`;
-        download.click();
-        URL.revokeObjectURL(url);
-        setAnalysisStatus('MIDI exported.', 'success');
-    } catch (error) {
-        console.error('MIDI export failed:', error);
-        setAnalysisStatus(`MIDI export failed: ${error.message || 'Unknown error'}`, 'error');
-    }
-}
 
 // Settings menu toggle
 const settingsTrigger = document.getElementById('settings-trigger');
@@ -3226,23 +2920,12 @@ if (fftSizeSelect) {
 if (monoScopeCheck) {
     console.log('Mono scope checkbox initialized');
 }
-if (analyzeSampleBtn) {
-    analyzeSampleBtn.addEventListener('click', handleAnalyzeSample);
-}
-if (cancelAnalysisBtn) {
-    cancelAnalysisBtn.addEventListener('click', handleCancelAnalysis);
-}
-if (exportMidiBtn) {
-    exportMidiBtn.addEventListener('click', handleExportMidi);
-}
 
 // Initialize alpha from slider's initial value
 handleSmoothingChange();
 
 // Initialize decay speed from slider's initial value
 handleDecaySpeedChange();
-setAnalysisStatus('Idle', 'idle');
-
 // Initialize canvas size
 resizeCanvas();
 resizeVectorScopeCanvas();
@@ -3317,9 +3000,6 @@ window.addEventListener('resize', () => {
         resizeCanvas();
         resizeVectorScopeCanvas();
         resizeOscilloscopeCanvas();
-        if (offlineAnalysisResult) {
-            renderAnalysisSummary(offlineAnalysisResult);
-        }
     }, 100); // Debounce resize events
 });
 
