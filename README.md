@@ -3,8 +3,7 @@
 A browser-based real-time audio analysis tool for music production and sound design. Visualize spectral content, identify peaks and resonances, track tonal balance, compare against reference tracks, and understand how sound evolves over time — all running client-side with the Web Audio API.
 
 **Zero dependencies. No build step. Pure vanilla JavaScript.**
-
-<img width="1280" alt="Spectrum Analyzer Screenshot" src="https://github.com/user-attachments/assets/b223db0b-178c-4045-b412-64e0e585fba0" />
+<img width="811" height="1277" alt="image" src="https://github.com/user-attachments/assets/89ab67a7-6710-470a-bed9-4f92f26fac4c" />
 
 ---
 
