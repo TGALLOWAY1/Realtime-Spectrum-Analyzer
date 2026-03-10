@@ -19,7 +19,8 @@ import {
     createSnapshot,
     serializeSnapshot,
     deserializeSnapshot,
-    computeDelta,
+    computeEnvelope,
+    computeEnvelopeDelta,
     computeBandDelta,
     computeInsightDelta,
     loadSnapshots,
@@ -62,12 +63,11 @@ const SPECTROGRAM_ASPECT_RATIO = 800 / 250; // 3.2:1
 // Comparison State (Phase 4)
 // Snapshot capture, reference overlay, and delta computation.
 // ============================================================
-let savedSnapshots = [];        // Array of snapshot objects (loaded from localStorage)
-let activeReference = null;     // Currently selected reference snapshot (or null)
-let showOverlay = true;         // Whether to render the reference overlay curve
-let showDelta = false;          // Whether to render the delta fill between live and reference
-let lastDelta = null;           // Cached per-bin delta (Float32Array), recomputed at insight rate
-let lastInsightDelta = null;    // Cached insight-level delta summary
+let savedSnapshots = [];            // Array of snapshot objects (loaded from localStorage)
+let activeReference = null;         // Currently selected reference snapshot (or null)
+let showOverlay = true;             // Whether to render the reference envelope band
+let lastEnvelopeDelta = null;       // Cached normalized envelope delta (Float32Array)
+let lastInsightDelta = null;        // Cached insight-level delta summary
 
 // Audio context and analysers (shared across all sources)
 let audioContext = null;
@@ -2013,11 +2013,21 @@ function resizeOscilloscopeCanvas() {
  * Draw the reference snapshot as a stroked curve on the spectrum chart.
  * Uses a rose/pink color to distinguish from the live cyan curve.
  */
-function drawReferenceOverlay(ctx, snapshot, width, height) {
-    if (!snapshot.averageData || snapshot.averageData.length === 0) return;
+/**
+ * Draw the reference spectral envelope — a shaded band showing the 10th–90th
+ * percentile range of the reference track's spectrum, with a median line.
+ * Renders like a "confidence interval" so the user can see where their live
+ * signal sits relative to the reference.
+ */
+function drawReferenceEnvelope(ctx, reference, width, height) {
+    const envelope = reference.envelope;
+    // Fallback for old snapshots without envelope: draw a simple dashed median line
+    const hasEnvelope = envelope && envelope.low && envelope.median && envelope.high;
+    const data = hasEnvelope ? envelope.median : reference.averageData;
+    if (!data || data.length === 0) return;
 
-    const sr = snapshot.sampleRate || getSampleRate();
-    const fftSz = snapshot.fftSize || (analyserLeft ? analyserLeft.fftSize : 4096);
+    const sr = reference.sampleRate || getSampleRate();
+    const fftSz = reference.fftSize || (analyserLeft ? analyserLeft.fftSize : 4096);
     const binCount = fftSz / 2;
     const freqPerBin = sr / fftSz;
 
@@ -2027,74 +2037,130 @@ function drawReferenceOverlay(ctx, snapshot, width, height) {
     const activeBottom = height - MARGIN_BOTTOM;
     const activeWidth = activeRight - activeLeft;
 
-    // Build points: map each pixel column to averaged snapshot dB
-    const points = [];
-    for (let px = activeLeft; px < activeRight; px++) {
-        const xNorm = (px - activeLeft) / activeWidth;
-        // Log frequency mapping (matches frequencyToX inverse)
-        const logMin = Math.log10(MIN_FREQ);
-        const logMax = Math.log10(MAX_FREQ);
-        const logF = logMin + xNorm * (logMax - logMin);
-        const freq = Math.pow(10, logF);
+    /**
+     * Helper: map each pixel column to a smoothed dB value from a bin array.
+     * Returns an array of { x, y } points clipped to the active area.
+     */
+    function buildCurve(binData) {
+        const points = [];
+        for (let px = activeLeft; px < activeRight; px++) {
+            const xNorm = (px - activeLeft) / activeWidth;
+            const logMin = Math.log10(MIN_FREQ);
+            const logMax = Math.log10(MAX_FREQ);
+            const logF = logMin + xNorm * (logMax - logMin);
+            const freq = Math.pow(10, logF);
 
-        const bin = Math.round(freq / freqPerBin);
-        if (bin < 0 || bin >= snapshot.averageData.length) continue;
+            const bin = Math.round(freq / freqPerBin);
+            if (bin < 0 || bin >= binData.length) continue;
 
-        // Average a few neighboring bins for smoothness
-        const halfW = 2;
-        let sum = 0, count = 0;
-        for (let b = Math.max(0, bin - halfW); b <= Math.min(binCount - 1, bin + halfW); b++) {
-            const val = snapshot.averageData[b];
-            if (isFinite(val)) { sum += val; count++; }
+            // Average a few neighboring bins for smoothness
+            const halfW = 2;
+            let sum = 0, count = 0;
+            for (let b = Math.max(0, bin - halfW); b <= Math.min(binCount - 1, bin + halfW); b++) {
+                const val = binData[b];
+                if (isFinite(val)) { sum += val; count++; }
+            }
+            if (count === 0) continue;
+
+            const avgDb = sum / count;
+            const y = dbToY(avgDb, height);
+            const clampedY = Math.max(activeTop, Math.min(activeBottom, y));
+            points.push({ x: px, y: clampedY });
         }
-        if (count === 0) continue;
-
-        const avgDb = sum / count;
-        const y = dbToY(avgDb, height);
-        const clampedY = Math.max(activeTop, Math.min(activeBottom, y));
-        points.push({ x: px, y: clampedY });
+        return points;
     }
 
-    if (points.length < 2) return;
-
-    // Draw the reference curve
     ctx.save();
     ctx.beginPath();
     ctx.rect(activeLeft, activeTop, activeWidth, activeBottom - activeTop);
     ctx.clip();
 
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) {
-        ctx.lineTo(points[i].x, points[i].y);
+    if (hasEnvelope) {
+        // ===== Full envelope: filled band (low → high) =====
+        const lowPts = buildCurve(envelope.low);
+        const highPts = buildCurve(envelope.high);
+        const medianPts = buildCurve(envelope.median);
+
+        if (highPts.length > 1 && lowPts.length > 1) {
+            // Draw filled band: top edge = high, bottom edge = low
+            ctx.beginPath();
+            // Forward along high curve (top of band)
+            ctx.moveTo(highPts[0].x, highPts[0].y);
+            for (let i = 1; i < highPts.length; i++) {
+                ctx.lineTo(highPts[i].x, highPts[i].y);
+            }
+            // Backward along low curve (bottom of band)
+            for (let i = lowPts.length - 1; i >= 0; i--) {
+                ctx.lineTo(lowPts[i].x, lowPts[i].y);
+            }
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(251, 113, 133, 0.10)'; // rose band fill
+            ctx.fill();
+
+            // Edge lines (subtle)
+            ctx.strokeStyle = 'rgba(251, 113, 133, 0.15)';
+            ctx.lineWidth = 0.5;
+            ctx.beginPath();
+            ctx.moveTo(highPts[0].x, highPts[0].y);
+            for (let i = 1; i < highPts.length; i++) ctx.lineTo(highPts[i].x, highPts[i].y);
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.moveTo(lowPts[0].x, lowPts[0].y);
+            for (let i = 1; i < lowPts.length; i++) ctx.lineTo(lowPts[i].x, lowPts[i].y);
+            ctx.stroke();
+        }
+
+        // Median line (thin solid rose)
+        if (medianPts.length > 1) {
+            ctx.beginPath();
+            ctx.moveTo(medianPts[0].x, medianPts[0].y);
+            for (let i = 1; i < medianPts.length; i++) {
+                ctx.lineTo(medianPts[i].x, medianPts[i].y);
+            }
+            ctx.strokeStyle = 'rgba(251, 113, 133, 0.45)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([]);
+            ctx.stroke();
+        }
+    } else {
+        // ===== Fallback for old snapshots: dashed median line =====
+        const pts = buildCurve(reference.averageData);
+        if (pts.length > 1) {
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+            ctx.strokeStyle = 'rgba(251, 113, 133, 0.5)';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([6, 3]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
     }
-    ctx.strokeStyle = 'rgba(251, 113, 133, 0.7)'; // rose-400
-    ctx.lineWidth = 2;
-    ctx.setLineDash([6, 3]);
-    ctx.stroke();
-    ctx.setLineDash([]);
 
     // Label
     ctx.font = '9px system-ui';
     ctx.fillStyle = 'rgba(251, 113, 133, 0.6)';
     ctx.textAlign = 'right';
     ctx.textBaseline = 'top';
-    const label = activeReference.label || 'reference';
-    ctx.fillText(label, activeRight - 4, activeTop + 4);
+    const label = reference.label || 'reference';
+    const envLabel = hasEnvelope ? `${label} (${envelope.frameCount} frames)` : label;
+    ctx.fillText(envLabel, activeRight - 4, activeTop + 4);
 
     ctx.restore();
 }
 
 /**
- * Draw the delta between live and reference as a filled area.
- * Green fill = live is louder, Red fill = reference was louder.
+ * Draw exceedance highlights where the live spectrum is meaningfully
+ * outside the reference envelope.
+ *   - Yellow bars: live > 90th percentile (too hot)
+ *   - Indigo bars: live < 10th percentile (too cold)
  */
-function drawDeltaFill(ctx, delta, width, height) {
-    if (!delta || delta.length === 0 || !averageData) return;
+function drawEnvelopeExceedance(ctx, envelopeDelta, reference, width, height) {
+    if (!envelopeDelta || !reference) return;
 
-    const sr = getSampleRate();
-    const fftSz = analyserLeft ? analyserLeft.fftSize : 4096;
-    const binCount = fftSz / 2;
+    const sr = reference.sampleRate || getSampleRate();
+    const fftSz = reference.fftSize || (analyserLeft ? analyserLeft.fftSize : 4096);
     const freqPerBin = sr / fftSz;
 
     const activeLeft = MARGIN_LEFT;
@@ -2104,19 +2170,12 @@ function drawDeltaFill(ctx, delta, width, height) {
     const activeWidth = activeRight - activeLeft;
     const activeHeight = activeBottom - activeTop;
 
-    // Map delta to pixel columns
-    const midY = activeTop + activeHeight / 2; // Zero-delta line
-
     ctx.save();
     ctx.beginPath();
     ctx.rect(activeLeft, activeTop, activeWidth, activeHeight);
     ctx.clip();
 
-    // Draw positive delta (live louder) — green fill above midline
-    // Draw negative delta (ref louder) — red fill below midline
-    // Scale: ±20 dB maps to full half-height
-    const maxDeltaDb = 20;
-
+    // For each pixel column, check if the normalized delta is outside ±1
     for (let px = activeLeft; px < activeRight; px++) {
         const xNorm = (px - activeLeft) / activeWidth;
         const logMin = Math.log10(MIN_FREQ);
@@ -2125,45 +2184,35 @@ function drawDeltaFill(ctx, delta, width, height) {
         const freq = Math.pow(10, logF);
 
         const bin = Math.round(freq / freqPerBin);
-        if (bin < 0 || bin >= delta.length) continue;
+        if (bin < 0 || bin >= envelopeDelta.length) continue;
 
-        const d = delta[bin];
-        if (!isFinite(d) || Math.abs(d) < 0.5) continue;
+        const d = envelopeDelta[bin];
+        if (!isFinite(d)) continue;
 
-        // Map delta to pixel height: ±maxDeltaDb → ±halfHeight
-        const norm = Math.max(-1, Math.min(1, d / maxDeltaDb));
-        const barHeight = Math.abs(norm) * (activeHeight / 2);
-
-        if (d > 0) {
-            // Live louder → green bar going up from midline
-            ctx.fillStyle = 'rgba(74, 222, 128, 0.25)'; // green-400
-            ctx.fillRect(px, midY - barHeight, 1, barHeight);
-        } else {
-            // Reference louder → red bar going down from midline
-            ctx.fillStyle = 'rgba(248, 113, 133, 0.25)'; // rose-400
-            ctx.fillRect(px, midY, 1, barHeight);
+        if (d > 1.0) {
+            // Live exceeds 90th percentile — yellow highlight
+            // Intensity scales with how far above
+            const intensity = Math.min(1, (d - 1.0) / 2.0);
+            const alpha = 0.08 + intensity * 0.22;
+            ctx.fillStyle = `rgba(250, 204, 21, ${alpha})`; // yellow-400
+            ctx.fillRect(px, activeTop, 1, activeHeight);
+        } else if (d < -1.0) {
+            // Live below 10th percentile — indigo highlight
+            const intensity = Math.min(1, (-d - 1.0) / 2.0);
+            const alpha = 0.08 + intensity * 0.22;
+            ctx.fillStyle = `rgba(129, 140, 248, ${alpha})`; // indigo-400
+            ctx.fillRect(px, activeTop, 1, activeHeight);
         }
     }
 
-    // Draw zero line
-    ctx.strokeStyle = 'rgba(156, 163, 175, 0.3)'; // gray-400
-    ctx.lineWidth = 0.5;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(activeLeft, midY);
-    ctx.lineTo(activeRight, midY);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    // Delta label
-    ctx.font = '9px system-ui';
-    ctx.fillStyle = 'rgba(156, 163, 175, 0.5)';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'top';
-    ctx.fillText('Δ delta', activeLeft + 4, activeTop + 4);
-
     ctx.restore();
 }
+
+/**
+ * Draw the delta between live and reference as a filled area.
+ * Green fill = live is louder, Red fill = reference was louder.
+ */
+// drawDeltaFill removed — replaced by drawEnvelopeExceedance above
 
 /**
  * Draw the spectrogram heatmap + metric overlay onto its dedicated canvas.
@@ -2505,7 +2554,7 @@ function update() {
         }
         return;
     }
-    
+
     if (!fftData) {
         if (Math.random() < 0.01) {
             console.warn('Update: No fftData array available');
@@ -2581,15 +2630,19 @@ function update() {
         // Update the DOM insight panel (low frequency — safe)
         updateInsightPanel();
 
-        // Phase 4: Recompute delta against active reference at insight rate
+        // Phase 4: Recompute envelope delta against active reference at insight rate
         if (activeReference && averageData) {
-            lastDelta = computeDelta(averageData, activeReference.averageData);
+            if (activeReference.envelope) {
+                lastEnvelopeDelta = computeEnvelopeDelta(averageData, activeReference.envelope);
+            } else {
+                lastEnvelopeDelta = null;
+            }
             if (activeReference.insights) {
                 lastInsightDelta = computeInsightDelta(insightState, activeReference.insights);
                 updateComparisonSummary();
             }
         } else {
-            lastDelta = null;
+            lastEnvelopeDelta = null;
             lastInsightDelta = null;
         }
 
@@ -2730,14 +2783,14 @@ function drawSpectrum(smoothed, ctx, width, height) {
     // so peak labels and centroid label are not clipped at active-area edges.
     ctx.restore();
 
-    // ===== LAYER 2.5: Reference Snapshot Overlay (Phase 4) =====
-    if (activeReference && showOverlay && activeReference.averageData) {
-        drawReferenceOverlay(ctx, activeReference, width, height);
+    // ===== LAYER 2.5: Reference Envelope Band (Phase 4) =====
+    if (activeReference && showOverlay) {
+        drawReferenceEnvelope(ctx, activeReference, width, height);
     }
 
-    // ===== LAYER 2.6: Delta Fill (Phase 4) =====
-    if (activeReference && showDelta && lastDelta) {
-        drawDeltaFill(ctx, lastDelta, width, height);
+    // ===== LAYER 2.6: Envelope Exceedance Highlights (Phase 4) =====
+    if (activeReference && showOverlay && lastEnvelopeDelta) {
+        drawEnvelopeExceedance(ctx, lastEnvelopeDelta, activeReference, width, height);
     }
 
     // ===== LAYER 3: Peak Markers (Phase 2) =====
@@ -3083,9 +3136,9 @@ function animate() {
         console.log('Animation stopped');
         return;
     }
-    
+
     frameCount++;
-    
+
     // Log every 60 frames (~1 second at 60fps)
     if (frameCount % 60 === 0) {
         console.log('Animation running, frame:', frameCount, {
@@ -3096,10 +3149,10 @@ function animate() {
             smoothedDataLength: smoothedData ? smoothedData.length : 0
         });
     }
-    
+
     update();
     draw();
-    
+
     animationFrameId = requestAnimationFrame(animate);
 }
 
@@ -3437,7 +3490,7 @@ handleSmoothingChange();
 const saveSnapshotBtn = document.getElementById('save-snapshot-btn');
 const snapshotSelect = document.getElementById('snapshot-select');
 const overlayToggle = document.getElementById('overlay-toggle');
-const deltaToggle = document.getElementById('delta-toggle');
+// deltaToggle removed — exceedance highlighting is automatic when envelope is visible
 const deleteSnapshotBtn = document.getElementById('delete-snapshot-btn');
 const comparisonSummary = document.getElementById('comparison-summary');
 const compBrightness = document.getElementById('comp-brightness');
@@ -3489,7 +3542,10 @@ function updateSaveButtonState() {
 }
 
 /**
- * Handle the Save Snapshot button click.
+ * Handle the Save Reference button click.
+ * Computes a spectral envelope from the recent spectrogram buffer
+ * (last ~300 frames ≈ 5 seconds at 60fps) and saves it alongside
+ * the current snapshot.
  */
 function handleSaveSnapshot() {
     if (!averageData || averageData.length === 0 || !audioContext || !analyserLeft) {
@@ -3497,6 +3553,9 @@ function handleSaveSnapshot() {
     }
 
     try {
+        // Compute envelope from recent spectrogram history (~5 seconds)
+        const envelope = computeEnvelope(spectrogramBuffer, 300);
+
         const snapshot = createSnapshot({
             averageData,
             smoothedData,
@@ -3504,6 +3563,7 @@ function handleSaveSnapshot() {
             sampleRate: audioContext.sampleRate,
             insightState,
             audioSource: audioSourceSelect ? audioSourceSelect.value : '',
+            envelope,
         });
 
         if (saveSnapshot(snapshot)) {
@@ -3518,13 +3578,13 @@ function handleSaveSnapshot() {
             saveSnapshotBtn.classList.add('bg-green-600/80');
             saveSnapshotBtn.classList.remove('bg-rose-600/80');
             setTimeout(() => {
-                saveSnapshotBtn.textContent = 'Save Snapshot';
+                saveSnapshotBtn.textContent = 'Save Reference';
                 saveSnapshotBtn.classList.remove('bg-green-600/80');
                 saveSnapshotBtn.classList.add('bg-rose-600/80');
             }, 1000);
         }
     } catch (err) {
-        console.warn('Failed to save snapshot:', err);
+        console.warn('Failed to save reference:', err);
     }
 }
 
@@ -3537,7 +3597,7 @@ function handleSnapshotSelect() {
     const selectedId = snapshotSelect.value;
     if (!selectedId) {
         activeReference = null;
-        lastDelta = null;
+        lastEnvelopeDelta = null;
         lastInsightDelta = null;
         hideComparisonSummary();
     } else {
@@ -3550,7 +3610,7 @@ function handleSnapshotSelect() {
 }
 
 /**
- * Handle delete snapshot button click.
+ * Handle delete reference button click.
  */
 function handleDeleteSnapshot() {
     if (!activeReference) return;
@@ -3558,7 +3618,7 @@ function handleDeleteSnapshot() {
     const id = activeReference.id;
     if (deleteSnapshot(id)) {
         activeReference = null;
-        lastDelta = null;
+        lastEnvelopeDelta = null;
         lastInsightDelta = null;
         savedSnapshots = loadSnapshots();
         rebuildSnapshotSelect();
@@ -3612,11 +3672,6 @@ if (snapshotSelect) {
 if (overlayToggle) {
     overlayToggle.addEventListener('change', (e) => {
         showOverlay = e.target.checked;
-    });
-}
-if (deltaToggle) {
-    deltaToggle.addEventListener('change', (e) => {
-        showDelta = e.target.checked;
     });
 }
 if (deleteSnapshotBtn) {

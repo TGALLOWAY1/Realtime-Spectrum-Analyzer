@@ -23,16 +23,16 @@
                 ></canvas>
             </div>
 
-            <!-- ===== Comparison Toolbar (Phase 4) ===== -->
+            <!-- ===== Reference Toolbar (Phase 4) ===== -->
             <div class="mb-3 flex items-center gap-3 flex-wrap">
-                <!-- Save Snapshot Button -->
+                <!-- Save Reference Button -->
                 <button
                     id="save-snapshot-btn"
                     class="bg-rose-600/80 hover:bg-rose-600 text-white text-xs font-semibold px-3 py-1.5 rounded transition-colors focus:outline-none focus:ring-2 focus:ring-rose-400 disabled:opacity-40 disabled:cursor-not-allowed"
                     disabled
-                    title="Save current spectrum as a reference snapshot"
+                    title="Capture a spectral envelope from recent audio as a reference"
                 >
-                    Save Snapshot
+                    Save Reference
                 </button>
 
                 <!-- Reference Selector -->
@@ -46,7 +46,7 @@
                     </select>
                 </div>
 
-                <!-- Show Overlay Toggle -->
+                <!-- Show Envelope Toggle -->
                 <label class="flex items-center gap-1.5 cursor-pointer select-none">
                     <input
                         type="checkbox"
@@ -54,25 +54,15 @@
                         class="w-3.5 h-3.5 bg-gray-700 border-gray-600 rounded text-rose-500 focus:ring-2 focus:ring-rose-400"
                         checked
                     />
-                    <span class="text-xs text-gray-400">Show Overlay</span>
+                    <span class="text-xs text-gray-400">Show Envelope</span>
                 </label>
 
-                <!-- Show Delta Toggle -->
-                <label class="flex items-center gap-1.5 cursor-pointer select-none">
-                    <input
-                        type="checkbox"
-                        id="delta-toggle"
-                        class="w-3.5 h-3.5 bg-gray-700 border-gray-600 rounded text-rose-500 focus:ring-2 focus:ring-rose-400"
-                    />
-                    <span class="text-xs text-gray-400">Show Delta</span>
-                </label>
-
-                <!-- Delete Snapshot Button -->
+                <!-- Delete Reference Button -->
                 <button
                     id="delete-snapshot-btn"
                     class="text-gray-500 hover:text-red-400 text-xs px-2 py-1 rounded transition-colors focus:outline-none disabled:opacity-30 disabled:cursor-not-allowed"
                     disabled
-                    title="Delete selected snapshot"
+                    title="Delete selected reference"
                 >
                     Delete
                 </button>
