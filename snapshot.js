@@ -3,8 +3,9 @@
  *
  * Architecture:
  *   - createSnapshot(): captures current FFT + insight state into a snapshot object
+ *   - computeEnvelope(): builds a spectral envelope (10th/50th/90th percentiles) from frame history
+ *   - computeEnvelopeDelta(): normalized position of live signal relative to envelope
  *   - serializeSnapshot() / deserializeSnapshot(): JSON ↔ typed-array conversion
- *   - computeDelta(): frequency-bin-level dB difference between live and reference
  *   - computeBandDelta(): per-band energy difference summary
  *   - SnapshotStore: localStorage-backed CRUD for named snapshots
  *
@@ -35,6 +36,7 @@ function generateId() {
  * @param {Object} params.insightState - Current insight metrics
  * @param {string} [params.label] - Optional user label
  * @param {string} [params.audioSource] - Name of the audio source
+ * @param {Object} [params.envelope] - Pre-computed spectral envelope { low, median, high, frameCount }
  * @returns {Object} Snapshot object
  */
 export function createSnapshot({
@@ -45,6 +47,7 @@ export function createSnapshot({
     insightState,
     label = '',
     audioSource = '',
+    envelope = null,
 }) {
     if (!averageData || averageData.length === 0) {
         throw new Error('Cannot create snapshot: no FFT data available');
@@ -56,6 +59,14 @@ export function createSnapshot({
     // Deep-copy the typed arrays so the snapshot is independent of live state
     const avgCopy = new Float32Array(averageData);
     const smoothCopy = smoothedData ? new Float32Array(smoothedData) : null;
+
+    // Deep-copy envelope if provided
+    const envCopy = envelope ? {
+        low: new Float32Array(envelope.low),
+        median: new Float32Array(envelope.median),
+        high: new Float32Array(envelope.high),
+        frameCount: envelope.frameCount,
+    } : null;
 
     // Deep-copy insight state
     const insights = insightState ? {
@@ -74,8 +85,119 @@ export function createSnapshot({
         sampleRate,
         averageData: avgCopy,
         smoothedData: smoothCopy,
+        envelope: envCopy,
         insights,
     };
+}
+
+
+// ============================================================
+// Envelope Computation
+// ============================================================
+
+/**
+ * Compute a spectral envelope from recent frames in a SpectrogramBuffer.
+ * Returns per-bin 10th / 50th / 90th percentile statistics, giving a
+ * "confidence interval" band that represents the reference track's
+ * spectral range over time.
+ *
+ * @param {SpectrogramBuffer} spectrogramBuffer - Ring buffer of FFT frames
+ * @param {number} [frameCount=300] - Number of recent frames to analyze (~5s at 60fps)
+ * @returns {{ low: Float32Array, median: Float32Array, high: Float32Array, frameCount: number } | null}
+ */
+export function computeEnvelope(spectrogramBuffer, frameCount = 300) {
+    if (!spectrogramBuffer || spectrogramBuffer.length === 0) return null;
+
+    const available = Math.min(frameCount, spectrogramBuffer.length);
+    if (available < 30) return null; // Need at least ~0.5s of data
+
+    const bins = spectrogramBuffer.binsPerFrame;
+    if (bins === 0) return null;
+
+    const low = new Float32Array(bins);
+    const median = new Float32Array(bins);
+    const high = new Float32Array(bins);
+
+    // Collect values per bin across frames
+    const temp = new Float32Array(available);
+
+    for (let b = 0; b < bins; b++) {
+        // Gather this bin's value across all frames
+        let validCount = 0;
+        for (let f = 0; f < available; f++) {
+            const frame = spectrogramBuffer.getFrame(f);
+            if (!frame) continue;
+            const val = frame[b];
+            if (isFinite(val)) {
+                temp[validCount++] = val;
+            }
+        }
+
+        if (validCount < 10) {
+            // Not enough valid data for this bin
+            low[b] = -100;
+            median[b] = -100;
+            high[b] = -100;
+            continue;
+        }
+
+        // Sort the valid portion for percentile computation
+        const sorted = temp.subarray(0, validCount).slice().sort();
+
+        // Percentile indices (0-indexed)
+        const p10Idx = Math.floor(validCount * 0.10);
+        const p50Idx = Math.floor(validCount * 0.50);
+        const p90Idx = Math.min(validCount - 1, Math.floor(validCount * 0.90));
+
+        low[b] = sorted[p10Idx];
+        median[b] = sorted[p50Idx];
+        high[b] = sorted[p90Idx];
+    }
+
+    return { low, median, high, frameCount: available };
+}
+
+/**
+ * Compute a normalized per-bin position of live data relative to the envelope.
+ *   0 = at median
+ *  +1 = at high (90th percentile)
+ *  -1 = at low (10th percentile)
+ *  >+1 = above the envelope
+ *  <-1 = below the envelope
+ *
+ * @param {Float32Array} liveData - Current averaged FFT data (dB)
+ * @param {Object} envelope - { low, median, high } Float32Arrays
+ * @returns {Float32Array|null} Normalized position per bin
+ */
+export function computeEnvelopeDelta(liveData, envelope) {
+    if (!liveData || !envelope || !envelope.low || !envelope.median || !envelope.high) return null;
+
+    const length = Math.min(liveData.length, envelope.median.length);
+    const delta = new Float32Array(length);
+
+    for (let i = 0; i < length; i++) {
+        const live = liveData[i];
+        const med = envelope.median[i];
+        const lo = envelope.low[i];
+        const hi = envelope.high[i];
+
+        if (!isFinite(live) || !isFinite(med)) {
+            delta[i] = 0;
+            continue;
+        }
+
+        if (live >= med) {
+            // Above median: normalize by (high - median) range
+            const range = hi - med;
+            delta[i] = range > 0.5 ? (live - med) / range : 0;
+        } else {
+            // Below median: normalize by (median - low) range
+            const range = med - lo;
+            delta[i] = range > 0.5 ? (live - med) / range : 0;
+        }
+    }
+
+    return delta;
 }
 
 
@@ -91,11 +213,25 @@ export function createSnapshot({
  * @returns {Object} JSON-safe object
  */
 export function serializeSnapshot(snapshot) {
-    return {
+    const serialized = {
         ...snapshot,
         averageData: Array.from(snapshot.averageData),
         smoothedData: snapshot.smoothedData ? Array.from(snapshot.smoothedData) : null,
     };
+
+    // Serialize envelope (three Float32Arrays + frameCount)
+    if (snapshot.envelope) {
+        serialized.envelope = {
+            low: Array.from(snapshot.envelope.low),
+            median: Array.from(snapshot.envelope.median),
+            high: Array.from(snapshot.envelope.high),
+            frameCount: snapshot.envelope.frameCount,
+        };
+    } else {
+        serialized.envelope = null;
+    }
+
+    return serialized;
 }
 
 /**
@@ -105,45 +241,31 @@ export function serializeSnapshot(snapshot) {
  * @returns {Object} Snapshot with Float32Arrays restored
  */
 export function deserializeSnapshot(obj) {
-    return {
+    const deserialized = {
         ...obj,
         averageData: new Float32Array(obj.averageData),
         smoothedData: obj.smoothedData ? new Float32Array(obj.smoothedData) : null,
     };
+
+    // Deserialize envelope if present (backward-compatible with old snapshots)
+    if (obj.envelope && obj.envelope.low && obj.envelope.median && obj.envelope.high) {
+        deserialized.envelope = {
+            low: new Float32Array(obj.envelope.low),
+            median: new Float32Array(obj.envelope.median),
+            high: new Float32Array(obj.envelope.high),
+            frameCount: obj.envelope.frameCount || 0,
+        };
+    } else {
+        deserialized.envelope = null;
+    }
+
+    return deserialized;
 }
 
 
 // ============================================================
 // Delta / Comparison Computation
 // ============================================================
-
-/**
- * Compute per-bin dB delta between live data and a reference snapshot.
- * Positive = live is louder, Negative = reference was louder.
- *
- * @param {Float32Array} liveData - Current averaged FFT data (dB)
- * @param {Float32Array} referenceData - Snapshot averaged FFT data (dB)
- * @returns {Float32Array} Per-bin delta in dB (same length as liveData)
- */
-export function computeDelta(liveData, referenceData) {
-    if (!liveData || !referenceData) return null;
-
-    const length = Math.min(liveData.length, referenceData.length);
-    const delta = new Float32Array(length);
-
-    for (let i = 0; i < length; i++) {
-        const live = liveData[i];
-        const ref = referenceData[i];
-
-        if (isFinite(live) && isFinite(ref)) {
-            delta[i] = live - ref;
-        } else {
-            delta[i] = 0;
-        }
-    }
-
-    return delta;
-}
 
 /**
  * Compute per-band energy delta between live and reference.
@@ -355,5 +477,5 @@ function formatTimestamp(ts) {
     const h = d.getHours().toString().padStart(2, '0');
     const m = d.getMinutes().toString().padStart(2, '0');
     const s = d.getSeconds().toString().padStart(2, '0');
-    return `Snap ${h}:${m}:${s}`;
+    return `Ref ${h}:${m}:${s}`;
 }
