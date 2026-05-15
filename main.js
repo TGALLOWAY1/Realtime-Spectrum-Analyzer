@@ -29,6 +29,27 @@ import {
     renameSnapshot,
 } from './snapshot.js';
 
+import {
+    rms as bufRms,
+    peak as bufPeak,
+    truePeak as bufTruePeak,
+    crestFactorDb as bufCrestFactorDb,
+    correlation as bufCorrelation,
+    balance as bufBalance,
+    midSideWidth as bufMidSideWidth,
+    classifyStereoField,
+    linearToDb,
+    clamp as numClamp,
+    fractionalOctaveSmoothDb,
+} from './audioMetrics.js';
+
+import {
+    createKWeightingChain,
+    LoudnessTracker,
+    RollingHistory,
+    METER_STANDARDS,
+} from './loudness.js';
+
 // ============================================================
 // Insight Panel State (Phase 2)
 // Updated at a throttled rate (~10 Hz) from per-frame FFT data.
@@ -68,6 +89,87 @@ let activeReference = null;         // Currently selected reference snapshot (or
 let showOverlay = true;             // Whether to render the reference envelope band
 let lastEnvelopeDelta = null;       // Cached normalized envelope delta (Float32Array)
 let lastInsightDelta = null;        // Cached insight-level delta summary
+
+// ============================================================
+// Dashboard State (LUFS / Stereo / Output / Dynamic / History)
+// All metric state below is updated at ~10 Hz from update();
+// DOM is written in updateDashboardPanels() at the same rate.
+// ============================================================
+
+const MASTERING_BANDS = [
+    { id: 'sub',        label: 'SUB',        range: '< 60 Hz',    min: 20,    max: 60,    color: '#7c3aed' },
+    { id: 'bass',       label: 'BASS',       range: '60-250 Hz',  min: 60,    max: 250,   color: '#0ea5e9' },
+    { id: 'low-mid',    label: 'LOW MID',    range: '250-500 Hz', min: 250,   max: 500,   color: '#10b981' },
+    { id: 'mid',        label: 'MID',        range: '500 Hz-2 kHz', min: 500, max: 2000,  color: '#eab308' },
+    { id: 'high-mid',   label: 'HIGH MID',   range: '2-5 kHz',    min: 2000,  max: 5000,  color: '#f97316' },
+    { id: 'presence',   label: 'PRESENCE',   range: '5-10 kHz',   min: 5000,  max: 10000, color: '#ef4444' },
+    { id: 'brilliance', label: 'BRILLIANCE', range: '> 10 kHz',   min: 10000, max: 20000, color: '#a855f7' },
+];
+
+let kWeightInput = null;
+let kWeightOutput = null;
+let kWeightedAnalyser = null;
+let kWeightedTimeData = null;
+let kWeightChainConnectedTo = null;
+let channelMergerForK = null;
+
+const loudnessTracker = new LoudnessTracker();
+let lastLoudnessSampleTime = -1;
+const loudnessHistory = {
+    momentary: new RollingHistory(3600),
+    short: new RollingHistory(3600),
+    integrated: new RollingHistory(3600),
+};
+
+// Peak/RMS history for the Dynamic Range panel. Each sample is the smoothed
+// L/R peak in linear units, sampled at the same ~10 Hz tick as the loudness
+// blocks, so the two history panels share a time axis.
+const dynamicsHistory = new RollingHistory(3600);
+let historyRangeS = 60;
+
+let dashboardSmoothed = {
+    peakLeftLin: 0,
+    peakRightLin: 0,
+    rmsLeftLin: 0,
+    rmsRightLin: 0,
+    truePeakLin: 0,
+    crestDb: 0,
+    correlation: 0,
+    width: 0,
+    balance: 0,
+};
+
+let outputStats = {
+    maxTruePeakLin: 0,
+    clipCount: 0,
+};
+
+let lufsFocus = 'momentary';
+let targetLufs = -23;
+let activeMeterStd = 'ebu';
+let spectrumScale = 'log';
+let spectrumModeAlphaScale = 1.0;
+let spectrumRtaFraction = 0;
+let spectrumHoldFrozen = false;
+let spectrumSmoothedSmooth = null;
+let spectrumAverageSmooth = null;
+let spectrogramRangeDb = 80;
+let spectrogramSpeedMultiplier = 1.0;
+let spectrogramOverlayMode = 'both';
+let spectrogramFrameSkip = 0;
+let spectrogramFrameAccumulator = 0;
+let lastDashboardUpdate = 0;
+const DASHBOARD_UPDATE_INTERVAL_MS = 100;
+
+let vectorscopeBandSelection = 'full';
+let vectorscopeCanvas = null;
+let vectorscopeCtx = null;
+let loudnessHistoryCanvas = null;
+let loudnessHistoryCtx = null;
+let dynamicsCanvas = null;
+let dynamicsCtx = null;
+let spectrumTooltipEl = null;
+let lastSpectrumHover = { hz: null, db: null, x: null, y: null };
 
 // Audio context and analysers (shared across all sources)
 let audioContext = null;
@@ -464,19 +566,16 @@ function binFrequency(i, sampleRate, binCount) {
  * @returns {number} X coordinate (accounting for left padding)
  */
 function frequencyToX(freq, width) {
-    // Clamp frequency to valid range
     const clampedFreq = Math.max(MIN_FREQ, Math.min(MAX_FREQ, freq));
-    
-    // Log10 mapping: map frequency to 0-1 range using log scale
+    const activeWidth = width - MARGIN_LEFT - MARGIN_RIGHT;
+    if (typeof spectrumScale !== 'undefined' && spectrumScale === 'linear') {
+        const normalized = (clampedFreq - MIN_FREQ) / (MAX_FREQ - MIN_FREQ);
+        return MARGIN_LEFT + normalized * activeWidth;
+    }
     const logMin = Math.log10(MIN_FREQ);
     const logMax = Math.log10(MAX_FREQ);
     const logFreq = Math.log10(clampedFreq);
-    
-    // Normalize to 0-1 range
     const normalized = (logFreq - logMin) / (logMax - logMin);
-    
-    // Map to active draw area (accounting for left and right margins)
-    const activeWidth = width - MARGIN_LEFT - MARGIN_RIGHT;
     return MARGIN_LEFT + normalized * activeWidth;
 }
 
@@ -488,27 +587,17 @@ function frequencyToX(freq, width) {
  * @returns {number} Frequency in Hz
  */
 function xToFrequency(x, width) {
-    // Account for left and right margins
     const activeWidth = width - MARGIN_LEFT - MARGIN_RIGHT;
-    
-    // Get position in active draw area (0 to activeWidth)
     const xInActiveArea = x - MARGIN_LEFT;
-    
-    // Normalize to 0-1 range
     const normalized = activeWidth > 0 ? xInActiveArea / activeWidth : 0;
-    
-    // Clamp normalized value to valid range
     const clampedNormalized = Math.max(0, Math.min(1, normalized));
-    
-    // Inverse logarithmic mapping: freq = min * (max/min)^normalized
-    // Using log10 for consistency with frequencyToX:
-    // log10(freq) = log10(MIN_FREQ) + normalized * (log10(MAX_FREQ) - log10(MIN_FREQ))
+    if (typeof spectrumScale !== 'undefined' && spectrumScale === 'linear') {
+        return MIN_FREQ + clampedNormalized * (MAX_FREQ - MIN_FREQ);
+    }
     const logMin = Math.log10(MIN_FREQ);
     const logMax = Math.log10(MAX_FREQ);
     const logFreq = logMin + clampedNormalized * (logMax - logMin);
-    const freq = Math.pow(10, logFreq);
-    
-    return freq;
+    return Math.pow(10, logFreq);
 }
 
 /**
@@ -679,9 +768,23 @@ function initializeAudioContext() {
         
         // Initialize waveform buffer size
         updateWaveformBufferSize();
-        
+
         // Compute bin indices for each band
         computeBandBinIndices();
+
+        // K-weighting chain + analyser for approximate LUFS metering.
+        kWeightedAnalyser = audioContext.createAnalyser();
+        kWeightedAnalyser.fftSize = 4096;
+        kWeightedAnalyser.smoothingTimeConstant = 0;
+        kWeightedTimeData = new Float32Array(kWeightedAnalyser.fftSize);
+        const chain = createKWeightingChain(audioContext);
+        kWeightInput = chain.input;
+        kWeightOutput = chain.output;
+        kWeightOutput.connect(kWeightedAnalyser);
+
+        // Allocate spectrum smoothing buffers used by the RTA selector.
+        spectrumSmoothedSmooth = new Float32Array(frequencyBinCount);
+        spectrumAverageSmooth = new Float32Array(frequencyBinCount);
     }
     return { 
         audioContext, 
@@ -743,7 +846,11 @@ function updateFFTSize(newSize) {
     
     // Re-compute band bin indices for the new FFT size
     computeBandBinIndices();
-    
+
+    // Re-allocate spectrum smoothing buffers
+    spectrumSmoothedSmooth = new Float32Array(frequencyBinCount);
+    spectrumAverageSmooth = new Float32Array(frequencyBinCount);
+
     // Reset state flags to prevent data mismatches
     emaInitialized = false;
     averageDataInitialized = false;
@@ -964,7 +1071,21 @@ function setupTestAudio(audioPath) {
             // Also connect splitter outputs to analyserLeft/analyserRight for spectrum visualization
             channelSplitter.connect(analLeft, 0);
             channelSplitter.connect(analRight, 1);
-            
+
+            // ===== K-WEIGHTING CHAIN (mono sum L+R -> K-weight -> kWeightedAnalyser) =====
+            // The K-weighting chain was created once in initializeAudioContext().
+            // Per-source we wire a mono merger of L+R into the chain input.
+            if (kWeightInput) {
+                if (channelMergerForK) {
+                    try { channelMergerForK.disconnect(); } catch (_) {}
+                }
+                channelMergerForK = ctx.createChannelMerger(2);
+                channelSplitter.connect(channelMergerForK, 0, 0);
+                channelSplitter.connect(channelMergerForK, 1, 1);
+                channelMergerForK.connect(kWeightInput);
+                kWeightChainConnectedTo = audioSource;
+            }
+
             // ===== CONNECT TO AUDIO OUTPUT =====
             // Connect source to destination for audio playback (maintains full stereo output)
             audioSource.connect(ctx.destination);
@@ -2231,10 +2352,14 @@ function drawSpectrogramWrapper() {
     if (spectrogramCanvas.style.width) cssWidth = parseFloat(spectrogramCanvas.style.width);
     if (spectrogramCanvas.style.height) cssHeight = parseFloat(spectrogramCanvas.style.height);
 
-    // Draw the heatmap
+    // Draw the heatmap. Pass the dpr through so the underlying putImageData
+    // fills the full CSS area (it ignores canvas transforms, so without dpr
+    // the heatmap covers only 1/dpr of the canvas width).
+    const minDbForRange = -Math.max(40, spectrogramRangeDb || 80);
     drawSpectrogram(spectrogramCtx, spectrogramBuffer, cssWidth, cssHeight, sr, fftSz, {
-        minDb: -100,
-        maxDb: -20,
+        minDb: minDbForRange,
+        maxDb: 0,
+        pixelRatio: dpr,
     });
 
     // Draw centroid + level overlay traces on top
@@ -2572,21 +2697,26 @@ function update() {
         console.warn('FFT data appears to be all NaN. Audio may not be flowing through analyser.');
     }
     
-    // Update smoothedData with fixed fast alpha (0.8) for responsive live view
-    if (smoothedData) {
+    // Update smoothedData with fixed fast alpha (0.8) for responsive live view.
+    // Hold mode freezes both live and average so the trace stays visible while you inspect.
+    if (smoothedData && !spectrumHoldFrozen) {
         updateEMA(fftData, smoothedData, SMOOTHED_DATA_ALPHA);
+        if (spectrumRtaFraction > 0 && audioContext && analyserLeft && spectrumSmoothedSmooth && spectrumSmoothedSmooth.length === smoothedData.length) {
+            fractionalOctaveSmoothDb(smoothedData, spectrumSmoothedSmooth, audioContext.sampleRate, analyserLeft.fftSize, spectrumRtaFraction);
+            smoothedData.set(spectrumSmoothedSmooth);
+        }
     }
-    
-    // Update averageData with variable alpha from slider (for long-term average)
-    if (averageData) {
-        // Use a separate initialization flag for averageData
+
+    // Update averageData with variable alpha from slider × mode scale.
+    if (averageData && !spectrumHoldFrozen) {
         if (!averageDataInitialized) {
             for (let i = 0; i < fftData.length; i++) {
                 averageData[i] = fftData[i];
             }
             averageDataInitialized = true;
         } else {
-            updateEMA(fftData, averageData, averageDataAlpha);
+            const effAlpha = averageDataAlpha * (spectrumModeAlphaScale || 1);
+            updateEMA(fftData, averageData, effAlpha);
         }
     }
     
@@ -2651,16 +2781,106 @@ function update() {
     }
 
     // ===== Phase 3: Push FFT frame into spectrogram buffer every frame =====
+    // Spectrogram speed multiplier: at 0.5x, push every other frame; 2x = push twice per frame.
     if (averageData && analyserLeft) {
-        spectrogramBuffer.push(averageData);
+        spectrogramFrameAccumulator += spectrogramSpeedMultiplier;
+        while (spectrogramFrameAccumulator >= 1) {
+            spectrogramBuffer.push(averageData);
 
-        // Push overall level (mean dB) for the level trace
-        let sum = 0;
-        let cnt = 0;
-        for (let i = 0; i < averageData.length; i++) {
-            if (isFinite(averageData[i])) { sum += averageData[i]; cnt++; }
+            let sum = 0;
+            let cnt = 0;
+            for (let i = 0; i < averageData.length; i++) {
+                if (isFinite(averageData[i])) { sum += averageData[i]; cnt++; }
+            }
+            levelHistory.push(cnt > 0 ? sum / cnt : -Infinity);
+            spectrogramFrameAccumulator -= 1;
         }
-        levelHistory.push(cnt > 0 ? sum / cnt : -Infinity);
+    }
+
+    // ===== Read L/R time-domain into existing buffers for output meters =====
+    if (analyserLeft && analyserRight && timeDomainDataLeft && timeDomainDataRight) {
+        analyserLeft.getFloatTimeDomainData(timeDomainDataLeft);
+        analyserRight.getFloatTimeDomainData(timeDomainDataRight);
+    }
+
+    // ===== Push K-weighted block into LoudnessTracker (~10 Hz) =====
+    const nowMs = performance.now();
+    if (kWeightedAnalyser && kWeightedTimeData && audioContext && nowMs - lastDashboardUpdate >= DASHBOARD_UPDATE_INTERVAL_MS) {
+        lastDashboardUpdate = nowMs;
+        kWeightedAnalyser.getFloatTimeDomainData(kWeightedTimeData);
+        let ms = 0;
+        for (let i = 0; i < kWeightedTimeData.length; i++) {
+            ms += kWeightedTimeData[i] * kWeightedTimeData[i];
+        }
+        ms /= kWeightedTimeData.length;
+        const dt = kWeightedTimeData.length / audioContext.sampleRate;
+        loudnessTracker.pushBlock(ms, dt);
+
+        // Compute output meter metrics from main analyser time-domain data.
+        if (timeDomainDataLeft && timeDomainDataRight) {
+            const peakL = bufPeak(timeDomainDataLeft);
+            const peakR = bufPeak(timeDomainDataRight);
+            const rmsL = bufRms(timeDomainDataLeft);
+            const rmsR = bufRms(timeDomainDataRight);
+            const tpL = bufTruePeak(timeDomainDataLeft);
+            const tpR = bufTruePeak(timeDomainDataRight);
+            const tp = Math.max(tpL, tpR);
+
+            const smoothA = 0.35;
+            dashboardSmoothed.peakLeftLin += smoothA * (peakL - dashboardSmoothed.peakLeftLin);
+            dashboardSmoothed.peakRightLin += smoothA * (peakR - dashboardSmoothed.peakRightLin);
+            dashboardSmoothed.rmsLeftLin += smoothA * (rmsL - dashboardSmoothed.rmsLeftLin);
+            dashboardSmoothed.rmsRightLin += smoothA * (rmsR - dashboardSmoothed.rmsRightLin);
+            dashboardSmoothed.truePeakLin = Math.max(dashboardSmoothed.truePeakLin * 0.92, tp);
+
+            const peakAll = Math.max(peakL, peakR);
+            const rmsAll = Math.sqrt((rmsL * rmsL + rmsR * rmsR) * 0.5);
+            const crest = rmsAll > 1e-9 ? linearToDb(peakAll / rmsAll) : 0;
+            dashboardSmoothed.crestDb += smoothA * (crest - dashboardSmoothed.crestDb);
+
+            const corr = bufCorrelation(timeDomainDataLeft, timeDomainDataRight);
+            dashboardSmoothed.correlation += smoothA * (corr - dashboardSmoothed.correlation);
+
+            const width = bufMidSideWidth(timeDomainDataLeft, timeDomainDataRight);
+            dashboardSmoothed.width += smoothA * (width - dashboardSmoothed.width);
+
+            const bal = bufBalance(rmsL, rmsR);
+            dashboardSmoothed.balance += smoothA * (bal - dashboardSmoothed.balance);
+
+            if (tp > outputStats.maxTruePeakLin) outputStats.maxTruePeakLin = tp;
+            // Clipping count: each tick where true peak >= 0.999 (≈ 0 dBFS) increments
+            if (tp >= 0.999) outputStats.clipCount += 1;
+        }
+
+        // Push loudness history samples for the history graph.
+        const tSec = nowMs / 1000;
+        const m = loudnessTracker.momentaryLufs();
+        const s = loudnessTracker.shortTermLufs();
+        const i = loudnessTracker.integratedLufs();
+        if (isFinite(m)) loudnessHistory.momentary.push(tSec, m);
+        if (isFinite(s)) loudnessHistory.short.push(tSec, s);
+        if (isFinite(i)) loudnessHistory.integrated.push(tSec, i);
+
+        // Dynamics history: store the combined-channel peak as a linear value
+        // so the waveform panel can show a stable peak envelope over the same
+        // time window as the loudness history.
+        const peakAllLin = Math.max(
+            dashboardSmoothed.peakLeftLin,
+            dashboardSmoothed.peakRightLin
+        );
+        const rmsAllLin = Math.sqrt(
+            (dashboardSmoothed.rmsLeftLin * dashboardSmoothed.rmsLeftLin +
+             dashboardSmoothed.rmsRightLin * dashboardSmoothed.rmsRightLin) * 0.5
+        );
+        dynamicsHistory.push(tSec, { peak: peakAllLin, rms: rmsAllLin });
+
+        const trimBefore = tSec - historyRangeS;
+        loudnessHistory.momentary.trimOlderThan(trimBefore);
+        loudnessHistory.short.trimOlderThan(trimBefore);
+        loudnessHistory.integrated.trimOlderThan(trimBefore);
+        dynamicsHistory.trimOlderThan(trimBefore);
+
+        updateDashboardPanels();
     }
 }
 
@@ -3125,6 +3345,9 @@ function draw() {
 
     // Draw spectrogram (Phase 3)
     drawSpectrogramWrapper();
+
+    // Dashboard panels (vectorscope, loudness history, output meter strip)
+    drawDashboardCanvases();
 }
 
 let frameCount = 0;
@@ -3853,3 +4076,667 @@ function handleMouseMove(event) {
 }
 
 // Vector scope doesn't need mouse event handlers (no tooltips)
+
+// ============================================================
+// Dashboard: LUFS / Stereo / Output / Dynamic Range / History
+// ============================================================
+
+function dashboardFormatLufs(v) {
+    if (!isFinite(v)) return '—';
+    return v.toFixed(1);
+}
+
+function dashboardFormatLu(v) {
+    if (!isFinite(v) || v <= 0) return '—';
+    return v.toFixed(1);
+}
+
+function dashboardLinearToDbStr(lin) {
+    if (!isFinite(lin) || lin <= 1e-7) return '−∞';
+    return linearToDb(lin).toFixed(1);
+}
+
+function populateBandStrip() {
+    const stripEl = document.getElementById('band-strip');
+    if (!stripEl) return;
+    stripEl.innerHTML = '';
+    for (const band of MASTERING_BANDS) {
+        const card = document.createElement('div');
+        card.className = 'band-card';
+        card.style.background = `linear-gradient(180deg, ${band.color}22 0%, ${band.color}11 50%, ${band.color}33 100%)`;
+        card.style.borderColor = `${band.color}66`;
+        card.innerHTML = `
+            <div class="name" style="color:${band.color}">${band.label}</div>
+            <div class="range">${band.range}</div>
+            <div class="val" id="band-strip-${band.id}">—</div>
+        `;
+        stripEl.appendChild(card);
+    }
+}
+
+/**
+ * Compute band-average dB on the smoothed FFT data, for the band strip.
+ * Returns dB (RMS aggregation) clamped to [-100, 0].
+ */
+function computeStripBandDb(band) {
+    if (!smoothedData || !audioContext || !analyserLeft) return NaN;
+    const fftSize = analyserLeft.fftSize;
+    const sampleRate = audioContext.sampleRate;
+    const binHz = sampleRate / fftSize;
+    const startBin = Math.max(0, Math.floor(band.min / binHz));
+    const endBin = Math.min(smoothedData.length - 1, Math.ceil(band.max / binHz));
+    if (endBin < startBin) return NaN;
+    let acc = 0;
+    let n = 0;
+    for (let i = startBin; i <= endBin; i++) {
+        const d = smoothedData[i];
+        if (isFinite(d)) {
+            const lin = Math.pow(10, d / 20);
+            acc += lin * lin;
+            n++;
+        }
+    }
+    if (n === 0) return NaN;
+    const rms = Math.sqrt(acc / n);
+    return linearToDb(rms);
+}
+
+function updateDashboardPanels() {
+    // ----- LUFS Panel -----
+    const m = loudnessTracker.momentaryLufs();
+    const s = loudnessTracker.shortTermLufs();
+    const itg = loudnessTracker.integratedLufs();
+    const lra = loudnessTracker.loudnessRange();
+
+    const primaryEl = document.getElementById('lufs-primary-value');
+    const primaryLabelEl = document.getElementById('lufs-primary-label');
+    const secondaryEl = document.getElementById('lufs-secondary-value');
+    const secondaryLabelEl = document.getElementById('lufs-secondary-label');
+
+    const focusValue = lufsFocus === 'short' ? s : lufsFocus === 'integrated' ? itg : m;
+    const focusLabel = lufsFocus === 'short' ? 'Short Term' : lufsFocus === 'integrated' ? 'Integrated' : 'Momentary';
+    const secondary = lufsFocus === 'integrated' ? s : itg;
+    const secondaryLabel = lufsFocus === 'integrated' ? 'Short Term' : 'Integrated';
+
+    if (primaryEl) primaryEl.textContent = dashboardFormatLufs(focusValue);
+    if (primaryLabelEl) primaryLabelEl.textContent = focusLabel;
+    if (secondaryEl) secondaryEl.textContent = dashboardFormatLufs(secondary);
+    if (secondaryLabelEl) secondaryLabelEl.textContent = secondaryLabel;
+
+    const lraEl = document.getElementById('lufs-lra-value');
+    if (lraEl) lraEl.textContent = dashboardFormatLu(lra);
+
+    // PLR = max true peak (dBTP) - integrated LUFS
+    const plrEl = document.getElementById('lufs-plr-value');
+    if (plrEl) {
+        const tpDb = outputStats.maxTruePeakLin > 1e-7 ? linearToDb(outputStats.maxTruePeakLin) : NaN;
+        if (isFinite(tpDb) && isFinite(itg)) {
+            plrEl.textContent = (tpDb - itg).toFixed(1);
+        } else {
+            plrEl.textContent = '—';
+        }
+    }
+
+    const targetEl = document.getElementById('lufs-target-value');
+    if (targetEl) targetEl.textContent = targetLufs.toFixed(1);
+
+    // ----- Stereo Imaging Panel -----
+    const corr = dashboardSmoothed.correlation;
+    const width = dashboardSmoothed.width;
+    const bal = dashboardSmoothed.balance;
+
+    const corrValEl = document.getElementById('stereo-corr-value');
+    if (corrValEl) corrValEl.textContent = isFinite(corr) ? corr.toFixed(2) : '—';
+    const corrMarkerEl = document.getElementById('stereo-corr-marker');
+    if (corrMarkerEl) {
+        const pct = numClamp((corr + 1) * 50, 0, 100);
+        corrMarkerEl.style.left = `${pct}%`;
+    }
+
+    const widthValEl = document.getElementById('stereo-width-value');
+    if (widthValEl) widthValEl.textContent = isFinite(width) ? width.toFixed(2) : '—';
+    const widthBarEl = document.getElementById('stereo-width-bar');
+    if (widthBarEl) {
+        const pct = numClamp(width * 60, 0, 100);
+        widthBarEl.style.width = `${pct}%`;
+    }
+
+    const balValEl = document.getElementById('stereo-balance-value');
+    if (balValEl) {
+        if (Math.abs(bal) < 0.02) balValEl.textContent = 'C';
+        else if (bal < 0) balValEl.textContent = `L ${Math.abs(bal * 100).toFixed(0)}%`;
+        else balValEl.textContent = `R ${(bal * 100).toFixed(0)}%`;
+    }
+    const balBarEl = document.getElementById('stereo-balance-bar');
+    if (balBarEl) {
+        const pct = numClamp(bal * 50, -50, 50);
+        if (pct >= 0) {
+            balBarEl.style.left = '50%';
+            balBarEl.style.width = `${pct}%`;
+        } else {
+            balBarEl.style.left = `${50 + pct}%`;
+            balBarEl.style.width = `${-pct}%`;
+        }
+        const intensity = Math.min(1, Math.abs(bal) * 2);
+        balBarEl.style.background = `rgba(${intensity > 0.6 ? '239,68,68' : '34,197,94'}, 0.8)`;
+    }
+
+    const statusEl = document.getElementById('stereo-status');
+    const statusTextEl = document.getElementById('stereo-status-text');
+    const hasSignal = dashboardSmoothed.peakLeftLin + dashboardSmoothed.peakRightLin > 1e-4;
+    if (statusTextEl) {
+        if (!hasSignal) {
+            statusTextEl.textContent = 'Awaiting audio…';
+            if (statusEl) statusEl.className = 'mt-3 flex items-center gap-1.5 text-[11px] text-gray-500';
+        } else {
+            const status = classifyStereoField(corr, width, bal);
+            statusTextEl.textContent = status;
+            if (statusEl) {
+                const cls = status === 'Stereo Field Looks Good'
+                    ? 'mt-3 flex items-center gap-1.5 text-[11px] text-emerald-400'
+                    : 'mt-3 flex items-center gap-1.5 text-[11px] text-amber-400';
+                statusEl.className = cls;
+            }
+        }
+    }
+
+    // ----- Output Meters Panel -----
+    const peakDb = dashboardSmoothed.truePeakLin > 1e-7 ? linearToDb(dashboardSmoothed.truePeakLin) : NaN;
+    const rmsCombined = Math.sqrt(
+        (dashboardSmoothed.rmsLeftLin * dashboardSmoothed.rmsLeftLin +
+         dashboardSmoothed.rmsRightLin * dashboardSmoothed.rmsRightLin) * 0.5
+    );
+    const rmsDb = rmsCombined > 1e-7 ? linearToDb(rmsCombined) : NaN;
+
+    const peakElTxt = document.getElementById('output-peak-value');
+    if (peakElTxt) peakElTxt.textContent = isFinite(peakDb) ? peakDb.toFixed(1) : '—';
+    const rmsElTxt = document.getElementById('output-rms-value');
+    if (rmsElTxt) rmsElTxt.textContent = isFinite(rmsDb) ? rmsDb.toFixed(1) : '—';
+
+    const dbToPctFromBottom = (db) => {
+        if (!isFinite(db)) return 0;
+        const minDb = -54;
+        return numClamp((db - minDb) / -minDb * 100, 0, 100);
+    };
+    const lDb = dashboardSmoothed.peakLeftLin > 1e-7 ? linearToDb(dashboardSmoothed.peakLeftLin) : -Infinity;
+    const rDb = dashboardSmoothed.peakRightLin > 1e-7 ? linearToDb(dashboardSmoothed.peakRightLin) : -Infinity;
+    const vmL = document.getElementById('vmeter-left-mask');
+    const vmR = document.getElementById('vmeter-right-mask');
+    if (vmL) vmL.style.height = `${100 - dbToPctFromBottom(lDb)}%`;
+    if (vmR) vmR.style.height = `${100 - dbToPctFromBottom(rDb)}%`;
+    const vmLDb = document.getElementById('vmeter-left-db');
+    if (vmLDb) vmLDb.textContent = isFinite(lDb) ? lDb.toFixed(1) : '−∞';
+    const vmRDb = document.getElementById('vmeter-right-db');
+    if (vmRDb) vmRDb.textContent = isFinite(rDb) ? rDb.toFixed(1) : '−∞';
+
+    // ----- Clipping Stats -----
+    const clipCountEl = document.getElementById('clip-count');
+    if (clipCountEl) clipCountEl.textContent = String(outputStats.clipCount);
+    const clipMaxEl = document.getElementById('clip-max-value');
+    if (clipMaxEl) {
+        clipMaxEl.textContent = outputStats.maxTruePeakLin > 1e-7
+            ? linearToDb(outputStats.maxTruePeakLin).toFixed(1)
+            : '—';
+    }
+    const tpWarn = document.getElementById('true-peak-warning');
+    if (tpWarn) {
+        if (outputStats.maxTruePeakLin >= 1.0) tpWarn.classList.remove('hidden');
+        else tpWarn.classList.add('hidden');
+    }
+
+    // ----- Dynamic Range Panel -----
+    const crestEl = document.getElementById('crest-factor-value');
+    if (crestEl) crestEl.textContent = isFinite(dashboardSmoothed.crestDb) && dashboardSmoothed.crestDb > 0
+        ? `${dashboardSmoothed.crestDb.toFixed(1)} dB`
+        : '—';
+    const drEl = document.getElementById('dynamic-range-value');
+    if (drEl) {
+        const dr = loudnessTracker.loudnessRange();
+        drEl.textContent = dr > 0 ? `${dr.toFixed(1)} LU` : '—';
+    }
+    const p2rEl = document.getElementById('peak-to-rms-value');
+    if (p2rEl) {
+        const peakLin = Math.max(dashboardSmoothed.peakLeftLin, dashboardSmoothed.peakRightLin);
+        const rmsLin = rmsCombined;
+        if (peakLin > 1e-7 && rmsLin > 1e-7) {
+            p2rEl.textContent = `${linearToDb(peakLin / rmsLin).toFixed(1)} dB`;
+        } else {
+            p2rEl.textContent = '—';
+        }
+    }
+
+    // ----- Band Strip -----
+    for (const band of MASTERING_BANDS) {
+        const el = document.getElementById(`band-strip-${band.id}`);
+        if (!el) continue;
+        const db = computeStripBandDb(band);
+        el.textContent = isFinite(db) && db > -100 ? `${db.toFixed(1)} dB` : '—';
+    }
+
+    // ----- Comparison summary (kept compatible) -----
+    if (lastInsightDelta) updateComparisonSummary();
+
+    // ----- Save Reference button enable state -----
+    updateSaveButtonState();
+}
+
+/**
+ * Pick the L/R time-domain pair that matches the selected vectorscope band.
+ */
+function pickVectorscopeData() {
+    switch (vectorscopeBandSelection) {
+        case 'sub':  return { l: timeDomainDataSubL,  r: timeDomainDataSubR,  color: '#6366f1' };
+        case 'low':  return { l: timeDomainDataLowL,  r: timeDomainDataLowR,  color: '#3b82f6' };
+        case 'mid':  return { l: timeDomainDataMidL,  r: timeDomainDataMidR,  color: '#14b8a6' };
+        case 'high': return { l: timeDomainDataHighL, r: timeDomainDataHighR, color: '#ef4444' };
+        case 'full':
+        default:     return { l: timeDomainDataLeft,  r: timeDomainDataRight, color: '#67e8f9' };
+    }
+}
+
+function drawSingleVectorscope() {
+    if (!vectorscopeCanvas || !vectorscopeCtx) return;
+    const { l, r, color } = pickVectorscopeData();
+    if (!l || !r) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = vectorscopeCanvas.width / dpr;
+    const cssH = vectorscopeCanvas.height / dpr;
+    if (typeof drawScope === 'function') {
+        drawScope(vectorscopeCtx, l, r, cssW, cssH, color);
+    }
+}
+
+/**
+ * Compute the shared time window (tMin..tNow) used by both the Loudness
+ * History and Dynamic Range panels. Returns null if no data has been recorded.
+ */
+function getSharedTimeWindow() {
+    const all = loudnessHistory.short.samples.length
+        ? loudnessHistory.short.samples
+        : dynamicsHistory.samples;
+    if (all.length === 0) return null;
+    const tNow = all[all.length - 1].t;
+    return { tNow, tMin: tNow - historyRangeS };
+}
+
+function drawLoudnessHistoryGraph() {
+    if (!loudnessHistoryCanvas || !loudnessHistoryCtx) return;
+    const ctx2 = loudnessHistoryCtx;
+    const dpr = window.devicePixelRatio || 1;
+    const w = loudnessHistoryCanvas.width / dpr;
+    const h = loudnessHistoryCanvas.height / dpr;
+
+    ctx2.fillStyle = '#030712';
+    ctx2.fillRect(0, 0, w, h);
+
+    const PAD_L = 30, PAD_R = 6, PAD_T = 4, PAD_B = 14;
+    const plotW = w - PAD_L - PAD_R;
+    const plotH = h - PAD_T - PAD_B;
+    if (plotW <= 0 || plotH <= 0) return;
+
+    const yMin = -60;
+    const yMax = -3;
+    const yRange = yMax - yMin;
+    const yToPx = (db) => PAD_T + plotH * (1 - (numClamp(db, yMin, yMax) - yMin) / yRange);
+
+    ctx2.strokeStyle = 'rgba(75, 85, 99, 0.35)';
+    ctx2.lineWidth = 1;
+    ctx2.fillStyle = '#4b5563';
+    ctx2.font = '9px ui-monospace, monospace';
+    ctx2.textAlign = 'right';
+    ctx2.textBaseline = 'middle';
+    for (let db = -6; db >= yMin; db -= 12) {
+        const y = yToPx(db);
+        ctx2.beginPath();
+        ctx2.moveTo(PAD_L, y);
+        ctx2.lineTo(PAD_L + plotW, y);
+        ctx2.stroke();
+        ctx2.fillText(`${db}`, PAD_L - 4, y);
+    }
+
+    const win = getSharedTimeWindow();
+    if (!win) {
+        ctx2.fillStyle = '#4b5563';
+        ctx2.font = '11px system-ui';
+        ctx2.textAlign = 'center';
+        ctx2.textBaseline = 'middle';
+        ctx2.fillText('Press Play to start measuring loudness…', w / 2, h / 2);
+        return;
+    }
+    const { tNow, tMin } = win;
+
+    ctx2.textAlign = 'center';
+    ctx2.textBaseline = 'top';
+    const xLabelStep = pickTimeAxisStep(historyRangeS);
+    for (let dt = -historyRangeS; dt <= 0; dt += xLabelStep) {
+        const x = PAD_L + plotW * ((tNow + dt - tMin) / historyRangeS);
+        ctx2.fillStyle = '#4b5563';
+        ctx2.fillText(formatTimeAxisLabel(dt, historyRangeS), x, PAD_T + plotH + 2);
+    }
+
+    ctx2.setLineDash([4, 4]);
+    ctx2.strokeStyle = 'rgba(156, 163, 175, 0.7)';
+    const tgtY = yToPx(targetLufs);
+    ctx2.beginPath();
+    ctx2.moveTo(PAD_L, tgtY);
+    ctx2.lineTo(PAD_L + plotW, tgtY);
+    ctx2.stroke();
+    ctx2.setLineDash([]);
+
+    const drawSeries = (samples, color, lineWidth = 1.5) => {
+        if (samples.length < 2) return;
+        ctx2.strokeStyle = color;
+        ctx2.lineWidth = lineWidth;
+        ctx2.beginPath();
+        let started = false;
+        for (const s of samples) {
+            if (s.t < tMin) continue;
+            const x = PAD_L + plotW * ((s.t - tMin) / historyRangeS);
+            const y = yToPx(s.value);
+            if (!started) { ctx2.moveTo(x, y); started = true; }
+            else ctx2.lineTo(x, y);
+        }
+        ctx2.stroke();
+    };
+
+    drawSeries(loudnessHistory.momentary.samples, '#34d399', 1);
+    drawSeries(loudnessHistory.short.samples,     '#38bdf8', 1.6);
+    drawSeries(loudnessHistory.integrated.samples, '#f472b6', 1.8);
+}
+
+function pickTimeAxisStep(rangeS) {
+    if (rangeS <= 15) return 3;
+    if (rangeS <= 30) return 5;
+    if (rangeS <= 60) return 15;
+    if (rangeS <= 120) return 30;
+    return 60;
+}
+
+function formatTimeAxisLabel(dt, rangeS) {
+    if (rangeS >= 120 && Math.abs(dt) >= 60) {
+        const m = Math.abs(dt) / 60;
+        return dt === 0 ? '0s' : `-${m % 1 === 0 ? m : m.toFixed(1)}m`;
+    }
+    return `${dt}s`;
+}
+
+function drawDynamicsHistoryWaveform() {
+    if (!dynamicsCanvas || !dynamicsCtx) return;
+    const ctx2 = dynamicsCtx;
+    const dpr = window.devicePixelRatio || 1;
+    const w = dynamicsCanvas.width / dpr;
+    const h = dynamicsCanvas.height / dpr;
+
+    ctx2.fillStyle = '#030712';
+    ctx2.fillRect(0, 0, w, h);
+
+    const PAD_L = 30, PAD_R = 6, PAD_T = 4, PAD_B = 14;
+    const plotW = w - PAD_L - PAD_R;
+    const plotH = h - PAD_T - PAD_B;
+    if (plotW <= 0 || plotH <= 0) return;
+
+    // Vertical centerline + horizontal grid at ±0.25, ±0.5, ±0.75
+    ctx2.strokeStyle = 'rgba(75, 85, 99, 0.35)';
+    ctx2.lineWidth = 1;
+    ctx2.beginPath();
+    ctx2.moveTo(PAD_L, PAD_T + plotH / 2);
+    ctx2.lineTo(PAD_L + plotW, PAD_T + plotH / 2);
+    ctx2.stroke();
+
+    ctx2.fillStyle = '#4b5563';
+    ctx2.font = '9px ui-monospace, monospace';
+    ctx2.textAlign = 'right';
+    ctx2.textBaseline = 'middle';
+    for (const frac of [0.25, 0.5, 0.75]) {
+        const yTop = PAD_T + plotH * 0.5 * (1 - frac);
+        const yBot = PAD_T + plotH * 0.5 * (1 + frac);
+        ctx2.strokeStyle = 'rgba(75, 85, 99, 0.2)';
+        ctx2.beginPath();
+        ctx2.moveTo(PAD_L, yTop);
+        ctx2.lineTo(PAD_L + plotW, yTop);
+        ctx2.moveTo(PAD_L, yBot);
+        ctx2.lineTo(PAD_L + plotW, yBot);
+        ctx2.stroke();
+    }
+    ctx2.fillText('+1', PAD_L - 4, PAD_T);
+    ctx2.fillText('0', PAD_L - 4, PAD_T + plotH / 2);
+    ctx2.fillText('-1', PAD_L - 4, PAD_T + plotH);
+
+    const win = getSharedTimeWindow();
+    if (!win || dynamicsHistory.samples.length === 0) {
+        ctx2.fillStyle = '#4b5563';
+        ctx2.font = '11px system-ui';
+        ctx2.textAlign = 'center';
+        ctx2.textBaseline = 'middle';
+        ctx2.fillText('Press Play to start measuring dynamics…', w / 2, h / 2);
+        return;
+    }
+    const { tNow, tMin } = win;
+
+    ctx2.textAlign = 'center';
+    ctx2.textBaseline = 'top';
+    const xLabelStep = pickTimeAxisStep(historyRangeS);
+    for (let dt = -historyRangeS; dt <= 0; dt += xLabelStep) {
+        const x = PAD_L + plotW * ((tNow + dt - tMin) / historyRangeS);
+        ctx2.fillStyle = '#4b5563';
+        ctx2.fillText(formatTimeAxisLabel(dt, historyRangeS), x, PAD_T + plotH + 2);
+    }
+
+    // Two-pass fill: peak envelope (light cyan) under, RMS envelope (darker cyan) over.
+    const drawEnvelope = (extractor, fill, stroke) => {
+        const samples = dynamicsHistory.samples;
+        let started = false;
+        ctx2.fillStyle = fill;
+        ctx2.beginPath();
+        for (const s of samples) {
+            if (s.t < tMin) continue;
+            const v = extractor(s.value);
+            const x = PAD_L + plotW * ((s.t - tMin) / historyRangeS);
+            const yTop = PAD_T + plotH * 0.5 * (1 - numClamp(v, 0, 1));
+            if (!started) { ctx2.moveTo(x, yTop); started = true; }
+            else ctx2.lineTo(x, yTop);
+        }
+        for (let i = samples.length - 1; i >= 0; i--) {
+            const s = samples[i];
+            if (s.t < tMin) continue;
+            const v = extractor(s.value);
+            const x = PAD_L + plotW * ((s.t - tMin) / historyRangeS);
+            const yBot = PAD_T + plotH * 0.5 * (1 + numClamp(v, 0, 1));
+            ctx2.lineTo(x, yBot);
+        }
+        if (started) {
+            ctx2.closePath();
+            ctx2.fill();
+        }
+        if (stroke && started) {
+            ctx2.strokeStyle = stroke;
+            ctx2.lineWidth = 1;
+            ctx2.stroke();
+        }
+    };
+
+    drawEnvelope((v) => v.peak || 0, 'rgba(56, 189, 248, 0.35)', null);
+    drawEnvelope((v) => v.rms  || 0, 'rgba(56, 189, 248, 0.85)', 'rgba(125, 211, 252, 0.9)');
+}
+
+function drawDashboardCanvases() {
+    drawSingleVectorscope();
+    drawDynamicsHistoryWaveform();
+    drawLoudnessHistoryGraph();
+}
+
+// ----- Spectrum hover tooltip -----
+function setupSpectrumHover() {
+    spectrumTooltipEl = document.getElementById('spectrumTooltip');
+    if (!canvas || !spectrumTooltipEl) return;
+
+    canvas.addEventListener('mousemove', (e) => {
+        if (!smoothedData || !audioContext || !analyserLeft) return;
+        const rect = canvas.getBoundingClientRect();
+        const xCss = e.clientX - rect.left;
+        const yCss = e.clientY - rect.top;
+        if (typeof xToFrequency !== 'function') return;
+
+        const hz = xToFrequency(xCss, rect.width);
+        if (!isFinite(hz) || hz < 20 || hz > 20000) {
+            spectrumTooltipEl.classList.add('hidden');
+            return;
+        }
+        const fftSize = analyserLeft.fftSize;
+        const sampleRate = audioContext.sampleRate;
+        const bin = Math.max(0, Math.min(smoothedData.length - 1, Math.round((hz / sampleRate) * fftSize)));
+        const db = smoothedData[bin];
+        spectrumTooltipEl.textContent = `${hz < 1000 ? hz.toFixed(0) + ' Hz' : (hz / 1000).toFixed(2) + ' kHz'}  ${isFinite(db) ? db.toFixed(1) + ' dB' : '—'}`;
+        spectrumTooltipEl.style.left = `${xCss + 12}px`;
+        spectrumTooltipEl.style.top = `${yCss + 12}px`;
+        spectrumTooltipEl.classList.remove('hidden');
+        lastSpectrumHover = { hz, db, x: xCss, y: yCss };
+    });
+    canvas.addEventListener('mouseleave', () => {
+        if (spectrumTooltipEl) spectrumTooltipEl.classList.add('hidden');
+    });
+}
+
+// ----- Dashboard wiring -----
+function setupDashboardWiring() {
+    // LUFS focus pill group
+    const lufsBtns = document.querySelectorAll('[data-lufs-focus]');
+    lufsBtns.forEach((btn) => {
+        btn.addEventListener('click', () => {
+            lufsFocus = btn.getAttribute('data-lufs-focus') || 'momentary';
+            lufsBtns.forEach((b) => b.classList.toggle('active', b === btn));
+            updateDashboardPanels();
+        });
+    });
+
+    // Meter standard buttons
+    const meterBtns = document.querySelectorAll('[data-meter-std]');
+    meterBtns.forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const id = btn.getAttribute('data-meter-std');
+            const tgt = parseFloat(btn.getAttribute('data-target') || '-14');
+            if (isFinite(tgt)) targetLufs = tgt;
+            activeMeterStd = id;
+            meterBtns.forEach((b) => b.classList.toggle('active', b === btn));
+            updateDashboardPanels();
+        });
+    });
+
+    // Vectorscope band selector
+    const vsSel = document.getElementById('vectorscope-band');
+    if (vsSel) {
+        vsSel.addEventListener('change', () => {
+            vectorscopeBandSelection = vsSel.value || 'full';
+        });
+    }
+
+    // Spectrum controls
+    const scaleSel = document.getElementById('spectrum-scale');
+    if (scaleSel) scaleSel.addEventListener('change', () => { spectrumScale = scaleSel.value; });
+
+    const modeSel = document.getElementById('spectrum-mode');
+    if (modeSel) modeSel.addEventListener('change', () => {
+        const v = modeSel.value;
+        spectrumModeAlphaScale = v === 'slow' ? 0.35 : v === 'medium' ? 0.6 : 1.0;
+        if (typeof handleSmoothingChange === 'function') handleSmoothingChange();
+    });
+
+    const rtaSel = document.getElementById('spectrum-rta');
+    if (rtaSel) rtaSel.addEventListener('change', () => {
+        spectrumRtaFraction = parseInt(rtaSel.value, 10) || 0;
+    });
+
+    const holdBtn = document.getElementById('spectrum-hold');
+    if (holdBtn) holdBtn.addEventListener('click', () => {
+        spectrumHoldFrozen = !spectrumHoldFrozen;
+        holdBtn.classList.toggle('active', spectrumHoldFrozen);
+    });
+
+    const underlayCb = document.getElementById('spectrum-underlay');
+    const underlayLabel = document.getElementById('spectrum-underlay-label');
+    if (underlayCb) underlayCb.addEventListener('change', () => {
+        showOverlay = underlayCb.checked;
+        if (underlayLabel) underlayLabel.classList.toggle('active', underlayCb.checked);
+    });
+    if (underlayCb && underlayLabel) underlayLabel.classList.toggle('active', underlayCb.checked);
+
+    // Spectrogram controls
+    const sgRange = document.getElementById('spectrogram-range');
+    if (sgRange) sgRange.addEventListener('change', () => {
+        spectrogramRangeDb = parseInt(sgRange.value, 10) || 80;
+    });
+    const sgSpeed = document.getElementById('spectrogram-speed');
+    if (sgSpeed) sgSpeed.addEventListener('change', () => {
+        spectrogramSpeedMultiplier = parseFloat(sgSpeed.value) || 1.0;
+    });
+    const sgOverlay = document.getElementById('spectrogram-overlay');
+    if (sgOverlay) sgOverlay.addEventListener('change', () => {
+        spectrogramOverlayMode = sgOverlay.value || 'both';
+    });
+
+    // Shared History Range select (affects Dynamic Range + Loudness History)
+    const rangeSel = document.getElementById('history-range');
+    if (rangeSel) {
+        rangeSel.addEventListener('change', () => {
+            const v = parseFloat(rangeSel.value);
+            if (isFinite(v) && v > 0) historyRangeS = v;
+        });
+    }
+
+    // Reset stats
+    const resetBtn = document.getElementById('reset-stats');
+    if (resetBtn) resetBtn.addEventListener('click', () => {
+        outputStats.maxTruePeakLin = 0;
+        outputStats.clipCount = 0;
+        loudnessTracker.reset();
+        loudnessHistory.momentary.reset();
+        loudnessHistory.short.reset();
+        loudnessHistory.integrated.reset();
+        dynamicsHistory.reset();
+        updateDashboardPanels();
+    });
+}
+
+function initDashboardCanvases() {
+    vectorscopeCanvas = document.getElementById('vectorscope-canvas');
+    vectorscopeCtx = vectorscopeCanvas ? vectorscopeCanvas.getContext('2d') : null;
+    loudnessHistoryCanvas = document.getElementById('loudness-history-canvas');
+    loudnessHistoryCtx = loudnessHistoryCanvas ? loudnessHistoryCanvas.getContext('2d') : null;
+    dynamicsCanvas = document.getElementById('dynamics-canvas');
+    dynamicsCtx = dynamicsCanvas ? dynamicsCanvas.getContext('2d') : null;
+
+    const fitCanvas = (cnv) => {
+        if (!cnv) return;
+        const dpr = window.devicePixelRatio || 1;
+        const rect = cnv.getBoundingClientRect();
+        const cssW = Math.max(60, rect.width);
+        const cssH = Math.max(60, rect.height);
+        cnv.width = Math.round(cssW * dpr);
+        cnv.height = Math.round(cssH * dpr);
+        cnv.style.width = cssW + 'px';
+        cnv.style.height = cssH + 'px';
+        const c2d = cnv.getContext('2d');
+        if (c2d) {
+            c2d.setTransform(1, 0, 0, 1, 0, 0);
+            c2d.scale(dpr, dpr);
+        }
+    };
+    fitCanvas(vectorscopeCanvas);
+    fitCanvas(loudnessHistoryCanvas);
+    fitCanvas(dynamicsCanvas);
+
+    window.addEventListener('resize', () => {
+        clearTimeout(initDashboardCanvases._resizeTo);
+        initDashboardCanvases._resizeTo = setTimeout(() => {
+            fitCanvas(vectorscopeCanvas);
+            fitCanvas(loudnessHistoryCanvas);
+            fitCanvas(dynamicsCanvas);
+        }, 100);
+    });
+}
+
+// Run startup wiring
+populateBandStrip();
+initDashboardCanvases();
+setupSpectrumHover();
+setupDashboardWiring();

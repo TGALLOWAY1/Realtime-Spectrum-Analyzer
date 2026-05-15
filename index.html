@@ -5,348 +5,567 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Real-Time Spectrum Analyzer</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        :root {
+            color-scheme: dark;
+        }
+        body {
+            font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+        }
+        .panel {
+            background: linear-gradient(180deg, #1f2937 0%, #111827 100%);
+            border: 1px solid rgba(75, 85, 99, 0.4);
+            border-radius: 10px;
+            box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 12px 30px rgba(0, 0, 0, 0.35);
+        }
+        .panel-title {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.14em;
+            color: #6b7280;
+            text-transform: uppercase;
+        }
+        .metric-label {
+            font-size: 9px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: #6b7280;
+            font-weight: 600;
+        }
+        .metric-value {
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+            font-weight: 700;
+            color: #f3f4f6;
+            letter-spacing: -0.02em;
+        }
+        .pill-btn {
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #d1d5db;
+            background: #1f2937;
+            border: 1px solid rgba(75, 85, 99, 0.6);
+            border-radius: 6px;
+            transition: background 120ms, border-color 120ms, color 120ms;
+            cursor: pointer;
+        }
+        .pill-btn:hover { background: #283242; border-color: rgba(96, 165, 250, 0.4); }
+        .pill-btn.active {
+            background: #2563eb;
+            color: #fff;
+            border-color: #1d4ed8;
+        }
+        .ctrl-select {
+            background: #111827;
+            color: #e5e7eb;
+            border: 1px solid rgba(75, 85, 99, 0.6);
+            border-radius: 6px;
+            padding: 3px 24px 3px 8px;
+            font-size: 11px;
+            font-weight: 500;
+            -webkit-appearance: none;
+            appearance: none;
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%239ca3af'%3e%3cpath d='M4 6l4 4 4-4' stroke='%239ca3af' stroke-width='1.4' fill='none' stroke-linecap='round'/%3e%3c/svg%3e");
+            background-repeat: no-repeat;
+            background-position: right 6px center;
+            background-size: 14px;
+        }
+        .ctrl-select:focus { outline: none; border-color: #60a5fa; }
+        .toggle-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #d1d5db;
+            background: #111827;
+            border: 1px solid rgba(75, 85, 99, 0.6);
+            border-radius: 999px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .toggle-pill.active {
+            background: rgba(37, 99, 235, 0.18);
+            border-color: rgba(96, 165, 250, 0.7);
+            color: #bfdbfe;
+        }
+        .toggle-pill input { display: none; }
+        canvas { display: block; }
+        .vmeter-cell {
+            height: 100%;
+            width: 14px;
+            background: linear-gradient(180deg,
+                #ef4444 0%, #ef4444 14%,
+                #f59e0b 14%, #f59e0b 28%,
+                #facc15 28%, #facc15 42%,
+                #65a30d 42%, #65a30d 70%,
+                #166534 70%, #166534 100%);
+            position: relative;
+            border-radius: 2px;
+            overflow: hidden;
+            border: 1px solid rgba(0, 0, 0, 0.4);
+        }
+        .vmeter-mask {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: rgba(8, 11, 19, 0.86);
+            transition: height 60ms linear;
+        }
+        .grid-app {
+            display: grid;
+            grid-template-columns: 230px minmax(0, 1fr) 200px;
+            grid-template-rows: auto;
+            gap: 14px;
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 14px;
+        }
+        @media (max-width: 1180px) {
+            .grid-app { grid-template-columns: minmax(0, 1fr); }
+            .sidebar-left, .sidebar-right { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+        }
+        .sidebar-left, .sidebar-right { display: flex; flex-direction: column; gap: 14px; }
+        .center { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+        .center-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+        @media (max-width: 900px) { .center-row { grid-template-columns: minmax(0, 1fr); } }
+        .band-grid {
+            display: grid;
+            grid-template-columns: repeat(7, minmax(0, 1fr));
+            gap: 6px;
+        }
+        @media (max-width: 720px) { .band-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+        .band-card {
+            border-radius: 8px;
+            padding: 8px 6px 8px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: space-between;
+            text-align: center;
+            min-height: 70px;
+            color: #f9fafb;
+            border: 1px solid rgba(0, 0, 0, 0.25);
+            box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset;
+        }
+        .band-card .name { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; opacity: 0.95; }
+        .band-card .range { font-size: 9px; opacity: 0.7; margin-top: 2px; }
+        .band-card .val { font-size: 14px; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+        .meter-standard-row { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
+        .nice-scroll { scrollbar-width: thin; scrollbar-color: #374151 transparent; }
+    </style>
 </head>
-<body class="bg-gray-900 text-gray-100 min-h-screen">
-    <div class="container mx-auto px-4 py-8 max-w-6xl">
-        <header class="mb-8">
-            <h1 class="text-3xl font-bold text-center">Real-Time Spectrum Analyzer</h1>
-        </header>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
 
-        <main>
-            <!-- Canvas Section -->
-            <div class="mb-6 bg-gray-800 rounded-lg p-4 shadow-lg">
-                <canvas 
-                    id="rta-canvas" 
-                    class="w-full bg-gray-950 rounded"
-                    width="800" 
-                    height="400"
-                ></canvas>
-            </div>
+    <div class="grid-app">
 
-            <!-- ===== Reference Toolbar (Phase 4) ===== -->
-            <div class="mb-3 flex items-center gap-3 flex-wrap">
-                <!-- Save Reference Button -->
-                <button
-                    id="save-snapshot-btn"
-                    class="bg-rose-600/80 hover:bg-rose-600 text-white text-xs font-semibold px-3 py-1.5 rounded transition-colors focus:outline-none focus:ring-2 focus:ring-rose-400 disabled:opacity-40 disabled:cursor-not-allowed"
-                    disabled
-                    title="Capture a spectral envelope from recent audio as a reference"
-                >
-                    Save Reference
-                </button>
+        <!-- ================= LEFT SIDEBAR ================= -->
+        <aside class="sidebar-left">
 
-                <!-- Reference Selector -->
-                <div class="flex items-center gap-2">
-                    <label for="snapshot-select" class="text-[10px] text-gray-500 uppercase tracking-wider font-semibold">Reference:</label>
-                    <select
-                        id="snapshot-select"
-                        class="bg-gray-800 text-gray-200 border border-gray-600 rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-rose-400 min-w-[140px]"
-                    >
-                        <option value="">None</option>
+            <!-- LUFS Panel -->
+            <section class="panel p-3" id="lufs-section">
+                <div class="flex items-center justify-between mb-2">
+                    <div class="panel-title">LUFS</div>
+                    <div class="flex gap-1" role="group" aria-label="LUFS readout mode">
+                        <button class="pill-btn active" data-lufs-focus="momentary" title="Show momentary (~400 ms)">M</button>
+                        <button class="pill-btn" data-lufs-focus="short" title="Show short-term (3 s)">S</button>
+                        <button class="pill-btn" data-lufs-focus="integrated" title="Show integrated (program)">I</button>
+                    </div>
+                </div>
+
+                <div class="space-y-2">
+                    <div>
+                        <div class="metric-label" id="lufs-primary-label">Short Term</div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span id="lufs-primary-value" class="metric-value text-2xl">—</span>
+                            <span class="metric-label" style="font-size:10px">LUFS</span>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="metric-label" id="lufs-secondary-label">Integrated</div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span id="lufs-secondary-value" class="metric-value text-lg" style="color:#86efac">—</span>
+                            <span class="metric-label" style="font-size:10px">LUFS</span>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="metric-label">Loudness Range</div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span id="lufs-lra-value" class="metric-value text-lg" style="color:#fde047">—</span>
+                            <span class="metric-label" style="font-size:10px">LU</span>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="metric-label">Dynamics (PLR)</div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span id="lufs-plr-value" class="metric-value text-lg" style="color:#f9a8d4">—</span>
+                            <span class="metric-label" style="font-size:10px">LU</span>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="metric-label">Target</div>
+                        <div class="flex items-baseline gap-1.5">
+                            <span id="lufs-target-value" class="metric-value text-lg" style="color:#a5b4fc">-14.0</span>
+                            <span class="metric-label" style="font-size:10px">LUFS</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Stereo Imaging Panel -->
+            <section class="panel p-3" id="stereo-section">
+                <div class="flex items-center justify-between mb-2">
+                    <div class="panel-title">Stereo Imaging</div>
+                    <select id="vectorscope-band" class="ctrl-select" title="Vectorscope band">
+                        <option value="full">Full</option>
+                        <option value="sub">Sub &lt; 120Hz</option>
+                        <option value="low">Lows 120-250Hz</option>
+                        <option value="mid">Mids 250Hz-2.5k</option>
+                        <option value="high">Highs &gt; 2.5k</option>
                     </select>
                 </div>
 
-                <!-- Show Envelope Toggle -->
-                <label class="flex items-center gap-1.5 cursor-pointer select-none">
-                    <input
-                        type="checkbox"
-                        id="overlay-toggle"
-                        class="w-3.5 h-3.5 bg-gray-700 border-gray-600 rounded text-rose-500 focus:ring-2 focus:ring-rose-400"
-                        checked
-                    />
-                    <span class="text-xs text-gray-400">Show Envelope</span>
-                </label>
+                <div class="relative">
+                    <canvas id="vectorscope-canvas" class="w-full rounded bg-gray-950 border border-gray-800" style="aspect-ratio:1/1;"></canvas>
+                    <div class="absolute top-1 left-2 text-[9px] text-gray-500 font-mono">M</div>
+                    <div class="absolute bottom-1 left-2 text-[9px] text-gray-500 font-mono">L</div>
+                    <div class="absolute bottom-1 right-2 text-[9px] text-gray-500 font-mono">R</div>
+                </div>
 
-                <!-- Delete Reference Button -->
-                <button
-                    id="delete-snapshot-btn"
-                    class="text-gray-500 hover:text-red-400 text-xs px-2 py-1 rounded transition-colors focus:outline-none disabled:opacity-30 disabled:cursor-not-allowed"
-                    disabled
-                    title="Delete selected reference"
-                >
-                    Delete
-                </button>
+                <div class="mt-3">
+                    <div class="flex items-center justify-between">
+                        <div class="metric-label">Width</div>
+                        <span id="stereo-width-value" class="text-[10px] font-mono text-gray-300">—</span>
+                    </div>
+                    <div class="h-2 bg-gray-900 rounded mt-1 overflow-hidden relative">
+                        <div id="stereo-width-bar" class="h-full bg-gradient-to-r from-indigo-500 to-cyan-300" style="width:0%"></div>
+                    </div>
+                </div>
 
-                <!-- Comparison Summary (appears when reference is active) -->
-                <div id="comparison-summary" class="ml-auto flex items-center gap-3 text-[10px] text-gray-500 hidden">
-                    <span id="comp-brightness" class="font-mono"></span>
-                    <span id="comp-tonal" class="font-mono"></span>
+                <div class="mt-3">
+                    <div class="flex items-center justify-between">
+                        <div class="metric-label">Correlation</div>
+                        <span id="stereo-corr-value" class="text-[10px] font-mono text-gray-300">—</span>
+                    </div>
+                    <div class="relative h-2 bg-gray-900 rounded mt-1">
+                        <div class="absolute inset-0 rounded" style="background: linear-gradient(to right, #ef4444 0%, #fde047 50%, #22c55e 100%); opacity:0.35;"></div>
+                        <div id="stereo-corr-marker" class="absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full bg-white shadow" style="left:50%;"></div>
+                    </div>
+                    <div class="flex justify-between text-[9px] text-gray-600 mt-0.5"><span>-1</span><span>0</span><span>+1</span></div>
+                </div>
+
+                <div class="mt-3">
+                    <div class="flex items-center justify-between">
+                        <div class="metric-label">Balance</div>
+                        <span id="stereo-balance-value" class="text-[10px] font-mono text-gray-300">C</span>
+                    </div>
+                    <div class="relative h-2 bg-gray-900 rounded mt-1">
+                        <div id="stereo-balance-bar" class="absolute top-0 bottom-0 bg-green-500/80 rounded" style="left:50%; width:1%;"></div>
+                    </div>
+                    <div class="flex justify-between text-[9px] text-gray-600 mt-0.5"><span>L</span><span>C</span><span>R</span></div>
+                </div>
+
+                <div id="stereo-status" class="mt-3 flex items-center gap-1.5 text-[11px] text-emerald-400">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                    <span id="stereo-status-text">Awaiting audio…</span>
+                </div>
+            </section>
+
+            <!-- Settings Trigger -->
+            <button
+                id="settings-trigger"
+                class="panel py-2 px-3 flex items-center justify-center gap-2 text-sm text-gray-300 hover:text-white hover:border-blue-500 transition-colors"
+                title="Open settings"
+            >
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                </svg>
+                <span class="font-semibold tracking-wide">Settings</span>
+            </button>
+        </aside>
+
+        <!-- ================= CENTER ================= -->
+        <section class="center">
+
+            <!-- Spectrum Panel -->
+            <div class="panel p-4">
+                <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+                    <div class="flex items-center gap-3">
+                        <button id="play-pause-btn"
+                            class="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-3 py-1.5 rounded text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            Play
+                        </button>
+                        <div class="panel-title">Spectrum Analyzer</div>
+                    </div>
+                    <div class="flex items-center flex-wrap gap-2">
+                        <label class="flex items-center gap-1 text-[10px] text-gray-400">Scale
+                            <select id="spectrum-scale" class="ctrl-select">
+                                <option value="log" selected>Log</option>
+                                <option value="linear">Linear</option>
+                            </select>
+                        </label>
+                        <button id="spectrum-hold" class="pill-btn" title="Freeze peak hold">Hold</button>
+                        <label class="toggle-pill" id="spectrum-underlay-label" title="Show reference envelope under live spectrum">
+                            <input type="checkbox" id="spectrum-underlay" checked>
+                            <span>Underlay</span>
+                        </label>
+                        <label class="flex items-center gap-1 text-[10px] text-gray-400">Mode
+                            <select id="spectrum-mode" class="ctrl-select" title="Response speed">
+                                <option value="fast" selected>Fast</option>
+                                <option value="medium">Medium</option>
+                                <option value="slow">Slow</option>
+                            </select>
+                        </label>
+                        <label class="flex items-center gap-1 text-[10px] text-gray-400">RTA
+                            <select id="spectrum-rta" class="ctrl-select" title="Fractional-octave smoothing">
+                                <option value="0" selected>Off</option>
+                                <option value="3">1/3 Oct</option>
+                                <option value="6">1/6 Oct</option>
+                                <option value="12">1/12 Oct</option>
+                            </select>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Reference toolbar (compact) -->
+                <div class="flex items-center gap-2 mb-2 flex-wrap">
+                    <button id="save-snapshot-btn"
+                        class="bg-rose-600/80 hover:bg-rose-600 text-white text-[11px] font-semibold px-2.5 py-1 rounded transition-colors focus:outline-none focus:ring-2 focus:ring-rose-400 disabled:opacity-40 disabled:cursor-not-allowed"
+                        disabled title="Capture a spectral envelope from recent audio">Save Reference</button>
+                    <select id="snapshot-select" class="ctrl-select" title="Active reference">
+                        <option value="">No Reference</option>
+                    </select>
+                    <button id="delete-snapshot-btn"
+                        class="text-gray-500 hover:text-red-400 text-[11px] px-2 py-1 rounded transition-colors focus:outline-none disabled:opacity-30 disabled:cursor-not-allowed"
+                        disabled title="Delete selected reference">Delete</button>
+                    <div id="comparison-summary" class="ml-auto flex items-center gap-3 text-[10px] text-gray-500 hidden">
+                        <span id="comp-brightness" class="font-mono"></span>
+                        <span id="comp-tonal" class="font-mono"></span>
+                    </div>
+                </div>
+
+                <!-- Peak readout overlay (top-right of canvas area) -->
+                <div class="relative">
+                    <div class="absolute top-2 right-2 z-10 flex gap-3 text-[10px] text-gray-400 font-mono pointer-events-none bg-gray-950/60 backdrop-blur-sm px-2 py-1 rounded">
+                        <span>MAX <span id="spectrum-max-readout" class="text-amber-300">—</span></span>
+                        <span>PEAK <span id="spectrum-peak-readout" class="text-pink-300">—</span></span>
+                    </div>
+                    <canvas id="rta-canvas" class="w-full bg-gray-950 rounded border border-gray-800" style="aspect-ratio:2.4/1;"></canvas>
+                    <div id="spectrumTooltip" class="absolute pointer-events-none px-2 py-1 rounded bg-gray-900/95 border border-gray-700 text-[10px] font-mono text-gray-200 shadow-lg hidden" style="z-index:20;">—</div>
                 </div>
             </div>
 
-            <!-- ===== Insight Panel (Phase 2) ===== -->
-            <div class="mb-6 bg-gray-800 rounded-lg p-4 shadow-lg">
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-
-                    <!-- Column 1: Band Energy Summary -->
-                    <div class="flex flex-col gap-2">
-                        <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1">Band Energy</h3>
-                        <div id="band-energy-bars" class="flex flex-col gap-1.5">
-                            <!-- Sub -->
-                            <div class="flex items-center gap-2">
-                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Sub</span>
-                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
-                                    <div id="band-bar-0" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#6366f1"></div>
-                                </div>
-                                <span id="band-val-0" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
-                            </div>
-                            <!-- Bass -->
-                            <div class="flex items-center gap-2">
-                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Bass</span>
-                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
-                                    <div id="band-bar-1" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#3b82f6"></div>
-                                </div>
-                                <span id="band-val-1" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
-                            </div>
-                            <!-- Low Mid -->
-                            <div class="flex items-center gap-2">
-                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Lo Mid</span>
-                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
-                                    <div id="band-bar-2" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#14b8a6"></div>
-                                </div>
-                                <span id="band-val-2" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
-                            </div>
-                            <!-- Mid -->
-                            <div class="flex items-center gap-2">
-                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Mid</span>
-                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
-                                    <div id="band-bar-3" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#eab308"></div>
-                                </div>
-                                <span id="band-val-3" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
-                            </div>
-                            <!-- Hi Mid -->
-                            <div class="flex items-center gap-2">
-                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Hi Mid</span>
-                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
-                                    <div id="band-bar-4" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#f97316"></div>
-                                </div>
-                                <span id="band-val-4" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
-                            </div>
-                            <!-- Air -->
-                            <div class="flex items-center gap-2">
-                                <span class="text-[10px] text-gray-400 w-12 text-right font-mono">Air</span>
-                                <div class="flex-1 h-3 bg-gray-950 rounded-sm overflow-hidden relative">
-                                    <div id="band-bar-5" class="h-full rounded-sm transition-[width] duration-100" style="width:0%; background:#ef4444"></div>
-                                </div>
-                                <span id="band-val-5" class="text-[10px] text-gray-500 w-9 text-right font-mono">—</span>
-                            </div>
+            <!-- Dynamic Range + Loudness History row -->
+            <div class="center-row">
+                <div class="panel p-3">
+                    <div class="flex items-center justify-between mb-2 gap-2">
+                        <div class="panel-title">Dynamic Range</div>
+                        <label class="flex items-center gap-1 text-[10px] text-gray-400">Range
+                            <select id="history-range" class="ctrl-select" title="Time range for Dynamic Range and Loudness History">
+                                <option value="15">15 s</option>
+                                <option value="30">30 s</option>
+                                <option value="60" selected>60 s</option>
+                                <option value="120">120 s</option>
+                                <option value="300">5 min</option>
+                            </select>
+                        </label>
+                    </div>
+                    <canvas id="dynamics-canvas" class="w-full bg-gray-950 rounded border border-gray-800" style="aspect-ratio:4/1;"></canvas>
+                    <div class="grid grid-cols-3 gap-2 mt-2">
+                        <div class="text-center bg-gray-900/60 rounded py-1.5">
+                            <div class="metric-label">Crest Factor</div>
+                            <div class="metric-value text-base" id="crest-factor-value">—</div>
+                        </div>
+                        <div class="text-center bg-gray-900/60 rounded py-1.5">
+                            <div class="metric-label">Dynamic Range</div>
+                            <div class="metric-value text-base" id="dynamic-range-value" style="color:#67e8f9">—</div>
+                        </div>
+                        <div class="text-center bg-gray-900/60 rounded py-1.5">
+                            <div class="metric-label">Peak to RMS</div>
+                            <div class="metric-value text-base" id="peak-to-rms-value">—</div>
                         </div>
                     </div>
+                </div>
 
-                    <!-- Column 2: Brightness / Centroid + Tonal Descriptor -->
-                    <div class="flex flex-col gap-3">
-                        <!-- Brightness Indicator -->
-                        <div class="flex flex-col gap-1.5">
-                            <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider">Brightness</h3>
-                            <div class="flex items-baseline gap-2">
-                                <span id="centroid-freq" class="text-lg font-semibold text-violet-400 font-mono">—</span>
-                                <span id="centroid-label" class="text-xs text-gray-400">—</span>
-                            </div>
-                            <!-- Centroid position indicator (slider-style) -->
-                            <div class="relative h-2 bg-gray-950 rounded-full overflow-visible mt-1">
-                                <!-- Track gradient: dark → bright -->
-                                <div class="absolute inset-0 rounded-full" style="background: linear-gradient(to right, #6366f1, #14b8a6, #eab308, #f97316, #ef4444); opacity: 0.35;"></div>
-                                <!-- Indicator dot -->
-                                <div id="centroid-bar" class="absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full bg-violet-400 border border-violet-300 shadow-sm shadow-violet-500/50 transition-[left] duration-100" style="left:50%"></div>
-                            </div>
-                            <div class="flex justify-between text-[9px] text-gray-600 mt-0.5">
-                                <span>Dark</span>
-                                <span>Bright</span>
-                            </div>
-                        </div>
-
-                        <!-- Tonal Descriptor -->
-                        <div class="flex flex-col gap-1">
-                            <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider">Tonal Character</h3>
-                            <span id="tonal-descriptor" class="text-sm font-medium text-cyan-300">—</span>
+                <div class="panel p-3">
+                    <div class="flex items-center justify-between mb-2">
+                        <div class="panel-title">Loudness History</div>
+                        <div class="flex items-center gap-2 text-[9px] text-gray-400">
+                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-400"></span>Momentary</span>
+                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-sky-400"></span>Short-Term</span>
+                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-pink-400"></span>Integrated</span>
+                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-gray-500"></span>Target</span>
                         </div>
                     </div>
-
-                    <!-- Column 3: Detected Peaks -->
-                    <div class="flex flex-col gap-1.5">
-                        <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1">Detected Peaks</h3>
-                        <div id="peak-list" class="flex flex-wrap gap-1.5">
-                            <span class="text-gray-500 text-xs">Press Play to analyze</span>
-                        </div>
-                    </div>
-
+                    <canvas id="loudness-history-canvas" class="w-full bg-gray-950 rounded border border-gray-800" style="aspect-ratio:4/1;"></canvas>
                 </div>
             </div>
 
-            <!-- ===== Spectrogram Section (Phase 3) ===== -->
-            <div class="mb-6 bg-gray-800 rounded-lg p-4 shadow-lg">
-                <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Spectrogram</h3>
-                <canvas
-                    id="spectrogram-canvas"
-                    class="w-full bg-gray-950 rounded border border-gray-700/50"
-                    width="800"
-                    height="250"
-                ></canvas>
-            </div>
-
-            <!-- Multi-Band Vector Scope Section -->
-            <div class="mb-6 bg-gray-800 rounded-lg p-4 shadow-lg">
-                <div class="flex gap-4">
-                    <!-- Sub Band Scope -->
-                    <div class="flex-1 flex flex-col gap-2">
-                        <canvas 
-                            id="scope-sub" 
-                            class="w-full bg-gray-950 rounded"
-                            width="300" 
-                            height="250"
-                        ></canvas>
-                        <label class="text-xs text-gray-400 text-center">Sub &lt; 120Hz</label>
-                    </div>
-                    
-                    <!-- Low Band Scope -->
-                    <div class="flex-1 flex flex-col gap-2">
-                        <canvas 
-                            id="scope-low" 
-                            class="w-full bg-gray-950 rounded"
-                            width="300" 
-                            height="250"
-                        ></canvas>
-                        <label class="text-xs text-gray-400 text-center">Lows 120-250Hz</label>
-                    </div>
-                    
-                    <!-- Mid Band Scope -->
-                    <div class="flex-1 flex flex-col gap-2">
-                        <canvas 
-                            id="scope-mid" 
-                            class="w-full bg-gray-950 rounded"
-                            width="300" 
-                            height="250"
-                        ></canvas>
-                        <label class="text-xs text-gray-400 text-center">Mids 250-2.5k</label>
-                    </div>
-                    
-                    <!-- High Band Scope -->
-                    <div class="flex-1 flex flex-col gap-2">
-                        <canvas 
-                            id="scope-high" 
-                            class="w-full bg-gray-950 rounded"
-                            width="300" 
-                            height="250"
-                        ></canvas>
-                        <label class="text-xs text-gray-400 text-center">Highs &gt; 2.5k</label>
+            <!-- Spectrogram Panel -->
+            <div class="panel p-3">
+                <div class="flex items-center justify-between mb-2 gap-3">
+                    <div class="panel-title">Spectrogram</div>
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <label class="flex items-center gap-1 text-[10px] text-gray-400">Range
+                            <select id="spectrogram-range" class="ctrl-select">
+                                <option value="60">60 dB</option>
+                                <option value="80" selected>80 dB</option>
+                                <option value="100">100 dB</option>
+                            </select>
+                        </label>
+                        <label class="flex items-center gap-1 text-[10px] text-gray-400">Speed
+                            <select id="spectrogram-speed" class="ctrl-select">
+                                <option value="0.5">Slow</option>
+                                <option value="1" selected>Med</option>
+                                <option value="2">Fast</option>
+                            </select>
+                        </label>
+                        <label class="flex items-center gap-1 text-[10px] text-gray-400">Overlay
+                            <select id="spectrogram-overlay" class="ctrl-select">
+                                <option value="both" selected>Centroid + Level</option>
+                                <option value="centroid">Centroid</option>
+                                <option value="level">Level</option>
+                                <option value="off">Off</option>
+                            </select>
+                        </label>
                     </div>
                 </div>
+                <canvas id="spectrogram-canvas" class="w-full bg-gray-950 rounded border border-gray-800" style="aspect-ratio:3.6/1;"></canvas>
             </div>
 
-            <!-- Oscilloscope Section -->
-            <div class="mb-6 bg-gray-800 rounded-lg p-4 shadow-lg">
-                <canvas 
-                    id="oscilloscope-canvas" 
-                    class="w-full bg-gray-950 rounded"
-                    width="800" 
-                    height="200"
-                ></canvas>
+            <!-- Frequency Bands Strip + Meter Standards -->
+            <div class="panel p-3">
+                <div class="flex items-center justify-between mb-2">
+                    <div class="panel-title">Frequency Bands</div>
+                    <div class="meter-standard-row" role="group" aria-label="Meter standard">
+                        <span class="metric-label mr-2">Meter</span>
+                        <button class="pill-btn" data-meter-std="k20" data-target="-20">K-20</button>
+                        <button class="pill-btn" data-meter-std="k14" data-target="-14">K-14</button>
+                        <button class="pill-btn active" data-meter-std="ebu" data-target="-23">EBU R128</button>
+                        <button class="pill-btn" data-meter-std="atsc" data-target="-24">ATSC A/85</button>
+                    </div>
+                </div>
+                <div id="band-strip" class="band-grid"></div>
             </div>
 
-        </main>
+        </section>
+
+        <!-- ================= RIGHT SIDEBAR ================= -->
+        <aside class="sidebar-right">
+
+            <!-- Output Meters -->
+            <section class="panel p-3" id="output-section">
+                <div class="panel-title mb-2">Output</div>
+
+                <div class="flex flex-col gap-2 mb-3">
+                    <div>
+                        <div class="metric-label">Peak</div>
+                        <div class="flex items-baseline gap-1">
+                            <span id="output-peak-value" class="metric-value text-lg" style="color:#fda4af">—</span>
+                            <span class="metric-label" style="font-size:10px">dBTP</span>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="metric-label">RMS</div>
+                        <div class="flex items-baseline gap-1">
+                            <span id="output-rms-value" class="metric-value text-lg" style="color:#86efac">—</span>
+                            <span class="metric-label" style="font-size:10px">dBFS</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="flex items-end justify-center gap-1.5 mb-1">
+                    <div class="flex flex-col items-center">
+                        <div class="text-[10px] text-gray-300 mb-1 font-semibold">L</div>
+                        <div class="vmeter-cell" style="height:320px; width:18px;">
+                            <div id="vmeter-left-mask" class="vmeter-mask" style="height:100%;"></div>
+                        </div>
+                        <div class="text-[9px] text-gray-500 mt-1 font-mono" id="vmeter-left-db">—∞</div>
+                    </div>
+                    <div class="relative text-[8px] text-gray-500 font-mono leading-none" style="height:320px; width:22px; margin-bottom:22px;">
+                        <div class="absolute left-0" style="top:0%; transform:translateY(-50%);">0</div>
+                        <div class="absolute left-0" style="top:11.1%; transform:translateY(-50%);">-6</div>
+                        <div class="absolute left-0" style="top:22.2%; transform:translateY(-50%);">-12</div>
+                        <div class="absolute left-0" style="top:33.3%; transform:translateY(-50%);">-18</div>
+                        <div class="absolute left-0" style="top:44.4%; transform:translateY(-50%);">-24</div>
+                        <div class="absolute left-0" style="top:55.5%; transform:translateY(-50%);">-30</div>
+                        <div class="absolute left-0" style="top:66.6%; transform:translateY(-50%);">-36</div>
+                        <div class="absolute left-0" style="top:77.7%; transform:translateY(-50%);">-42</div>
+                        <div class="absolute left-0" style="top:88.8%; transform:translateY(-50%);">-48</div>
+                        <div class="absolute left-0" style="top:100%; transform:translateY(-50%);">-54</div>
+                    </div>
+                    <div class="flex flex-col items-center">
+                        <div class="text-[10px] text-gray-300 mb-1 font-semibold">R</div>
+                        <div class="vmeter-cell" style="height:320px; width:18px;">
+                            <div id="vmeter-right-mask" class="vmeter-mask" style="height:100%;"></div>
+                        </div>
+                        <div class="text-[9px] text-gray-500 mt-1 font-mono" id="vmeter-right-db">—∞</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Clipping / Stats -->
+            <section class="panel p-3" id="clipping-section">
+                <div class="panel-title mb-2">Clipping</div>
+                <div class="space-y-2">
+                    <div>
+                        <div class="metric-label">Count</div>
+                        <div class="metric-value text-xl" id="clip-count">0</div>
+                    </div>
+                    <div>
+                        <div class="metric-label">Max Since Reset</div>
+                        <div class="flex items-baseline gap-1">
+                            <span id="clip-max-value" class="metric-value text-base">—</span>
+                            <span class="metric-label" style="font-size:10px">dBTP</span>
+                        </div>
+                    </div>
+                    <div id="true-peak-warning" class="hidden bg-red-900/40 border border-red-700/60 rounded px-2 py-1 text-[10px] text-red-300 font-semibold flex items-center gap-1">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+                        True Peak &gt; 0 dBTP
+                    </div>
+                </div>
+                <button id="reset-stats" class="mt-3 w-full pill-btn text-center">RESET</button>
+            </section>
+        </aside>
     </div>
 
-    <script type="module" src="./main.js"></script>
-    
-    <!-- Top Right Controls -->
-    <div class="fixed top-6 right-6 z-50 flex items-center gap-3">
-        <!-- Play/Pause Button -->
-        <button 
-            id="play-pause-btn" 
-            class="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-4 py-2 rounded transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500"
-        >
-            Play
-        </button>
-        
-        <!-- Settings Trigger Button -->
-        <button 
-            id="settings-trigger" 
-            class="w-12 h-12 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded-full shadow-lg flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500"
-            title="Settings"
-        >
-            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-            </svg>
-        </button>
-    </div>
 
-    <!-- Floating Settings Menu -->
-    <div id="settings-menu" class="fixed top-20 right-6 z-50 hidden">
+    <!-- Floating Settings Menu (same as before) -->
+    <div id="settings-menu" class="fixed bottom-6 left-6 z-50 hidden">
         <div class="bg-gray-900/95 backdrop-blur-sm border border-gray-700 rounded-lg shadow-2xl p-4 min-w-[280px]">
             <div class="flex flex-col divide-y divide-gray-700">
-                <!-- Input Section -->
                 <div class="flex flex-col gap-4 py-3">
-                    <!-- Audio Source Dropdown -->
                     <div class="flex flex-col gap-2">
-                        <label for="audio-source" class="text-sm font-medium text-gray-300">
-                            Audio Source
-                        </label>
-                        <select 
-                            id="audio-source" 
-                            class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        >
-                            <option value="TEST AUDIO/D#m - 140BPM - Triple M v3.wav">
-                                D#m - 140BPM - Triple M v3 (WAV)
-                            </option>
-                            <option value="TEST AUDIO/D#m - 140BPM - Triple M v3.mp3">
-                                D#m - 140BPM - Triple M v3 (MP3)
-                            </option>
+                        <label for="audio-source" class="text-sm font-medium text-gray-300">Audio Source</label>
+                        <select id="audio-source" class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="TEST AUDIO/D#m - 140BPM - Triple M v3.wav">D#m - 140BPM - Triple M v3 (WAV)</option>
+                            <option value="TEST AUDIO/D#m - 140BPM - Triple M v3.mp3">D#m - 140BPM - Triple M v3 (MP3)</option>
                         </select>
                     </div>
                 </div>
 
-                <!-- Spectrogram Section -->
                 <div class="flex flex-col gap-4 py-3">
                     <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Spectrogram</h3>
-                    
-                    <!-- Average Curve Response Slider -->
                     <div class="flex flex-col gap-2">
-                        <label for="smoothing-slider" class="text-sm font-medium text-gray-300">
-                            Average Curve Response: <span id="smoothing-value">50</span>%
-                        </label>
-                        <input 
-                            type="range" 
-                            id="smoothing-slider" 
-                            min="0" 
-                            max="100" 
-                            value="50" 
-                            class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                        />
-                        <div class="text-xs text-gray-500 text-center">Fast <----> Slow</div>
+                        <label for="smoothing-slider" class="text-sm font-medium text-gray-300">Average Curve Response: <span id="smoothing-value">50</span>%</label>
+                        <input type="range" id="smoothing-slider" min="0" max="100" value="50" class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-600"/>
+                        <div class="text-xs text-gray-500 text-center">Fast &lt;----&gt; Slow</div>
                     </div>
                 </div>
 
-                <!-- Analyzer Section -->
                 <div class="flex flex-col gap-4 py-3">
                     <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Analyzer / Scope</h3>
-                    
-                    <!-- Peak Hold / Decay Slider -->
                     <div class="flex flex-col gap-2">
-                        <label for="decay-speed-slider" class="text-sm font-medium text-gray-300">
-                            Peak Hold / Decay: <span id="decay-speed-value">1.00</span>x
-                        </label>
-                        <input 
-                            type="range" 
-                            id="decay-speed-slider" 
-                            min="0.25" 
-                            max="2.0" 
-                            step="0.05" 
-                            value="1.0" 
-                            class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                        />
-                        <div class="text-xs text-gray-500 text-center">Short <----> Long</div>
+                        <label for="decay-speed-slider" class="text-sm font-medium text-gray-300">Peak Hold / Decay: <span id="decay-speed-value">1.00</span>x</label>
+                        <input type="range" id="decay-speed-slider" min="0.25" max="2.0" step="0.05" value="1.0" class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-600"/>
+                        <div class="text-xs text-gray-500 text-center">Short &lt;----&gt; Long</div>
                     </div>
-                    
-                    <!-- FFT Size Dropdown -->
                     <div class="flex flex-col gap-2">
-                        <label for="fft-size-select" class="text-sm font-medium text-gray-300">
-                            FFT Size
-                        </label>
-                        <select 
-                            id="fft-size-select" 
-                            class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        >
+                        <label for="fft-size-select" class="text-sm font-medium text-gray-300">FFT Size</label>
+                        <select id="fft-size-select" class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
                             <option value="4096" selected>4096 (High Res)</option>
                             <option value="2048">2048 (Standard)</option>
                             <option value="1024">1024 (Fast)</option>
@@ -355,58 +574,28 @@
                     </div>
                 </div>
 
-                <!-- Oscilloscope Section -->
                 <div class="flex flex-col gap-4 py-3">
-                    <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Oscilloscope</h3>
-                    
-                    <!-- View Length Dropdown -->
+                    <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Dynamic Range Waveform</h3>
                     <div class="flex flex-col gap-2">
-                        <label for="view-length" class="text-sm font-medium text-gray-300">
-                            View Length
-                        </label>
-                        <select 
-                            id="view-length" 
-                            class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        >
+                        <label for="view-length" class="text-sm font-medium text-gray-300">View Length</label>
+                        <select id="view-length" class="bg-gray-700 text-gray-100 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
                             <option value="1">1 Bar</option>
                             <option value="4" selected>4 Bars</option>
                             <option value="8">8 Bars</option>
                         </select>
                     </div>
-                    
-                    <!-- Mono Sum Checkbox -->
                     <div class="flex items-center gap-2">
-                        <input 
-                            type="checkbox" 
-                            id="mono-scope-check" 
-                            class="w-4 h-4 bg-gray-700 border-gray-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
-                        />
-                        <label for="mono-scope-check" class="text-sm font-medium text-gray-300 cursor-pointer">
-                            Mono Sum (Check Phase)
-                        </label>
+                        <input type="checkbox" id="mono-scope-check" class="w-4 h-4 bg-gray-700 border-gray-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"/>
+                        <label for="mono-scope-check" class="text-sm font-medium text-gray-300 cursor-pointer">Mono Sum (Check Phase)</label>
                     </div>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- Band Tooltip - Fixed position for guaranteed visibility -->
-    <div
-        id="bandTooltip"
-        style="
-            position: fixed;
-            pointer-events: none;
-            padding: 4px 8px;
-            border-radius: 4px;
-            background: rgba(15, 23, 42, 0.95);
-            color: #fefce8;
-            font-size: 11px;
-            line-height: 1.3;
-            display: none;
-            z-index: 9999;
-            border: 1px solid #facc15;
-            white-space: nowrap;
-        "
-    ></div>
+    <!-- Tooltip for band hover (kept for compatibility) -->
+    <div id="bandTooltip" style="position: fixed; pointer-events: none; padding: 4px 8px; border-radius: 4px; background: rgba(15, 23, 42, 0.95); color: #fefce8; font-size: 11px; line-height: 1.3; display: none; z-index: 9999; border: 1px solid #facc15; white-space: nowrap;"></div>
+
+    <script type="module" src="./main.js"></script>
 </body>
 </html>

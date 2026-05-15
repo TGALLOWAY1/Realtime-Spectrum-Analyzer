@@ -217,6 +217,7 @@ export function drawSpectrogram(ctx, buffer, width, height, sampleRate, fftSize,
         maxDb = -20,
         minFreq = 20,
         maxFreq = 20000,
+        pixelRatio = 1,
     } = options;
 
     // Margins matching the main spectrum chart
@@ -252,38 +253,33 @@ export function drawSpectrogram(ctx, buffer, width, height, sampleRate, fftSize,
     const logMaxFreq = Math.log10(maxFreq);
     const logFreqRange = logMaxFreq - logMinFreq;
 
-    // Create an ImageData for efficient pixel writes
-    // We write to a temporary buffer at the active area dimensions, then putImageData
-    const imgData = ctx.createImageData(activeWidth, activeHeight);
+    // putImageData ignores the canvas transform — it writes raw physical pixels.
+    // So we generate the heatmap at physical pixel resolution and place it at
+    // the physical-pixel offset that matches our CSS-pixel active area.
+    const physW = Math.max(1, Math.round(activeWidth * pixelRatio));
+    const physH = Math.max(1, Math.round(activeHeight * pixelRatio));
+    const imgData = ctx.createImageData(physW, physH);
     const pixels = imgData.data;
 
-    // Number of time columns to display = min(frameCount, activeWidth)
-    const columnsToShow = Math.min(frameCount, activeWidth);
+    const columnsToShow = Math.min(frameCount, physW);
 
-    // Map each pixel
-    for (let px = 0; px < activeWidth; px++) {
-        // Time: map pixel X to frame age
-        // px=0 (left) = oldest visible, px=activeWidth-1 (right) = newest
-        const age = columnsToShow - 1 - Math.floor((px / activeWidth) * columnsToShow);
+    for (let px = 0; px < physW; px++) {
+        const age = columnsToShow - 1 - Math.floor((px / physW) * columnsToShow);
         const frame = buffer.getFrame(age);
         if (!frame) continue;
 
-        for (let py = 0; py < activeHeight; py++) {
-            // Frequency: map pixel Y (top=high freq, bottom=low freq) to log frequency
-            const yNorm = py / activeHeight; // 0=top, 1=bottom
-            const logFreq = logMaxFreq - yNorm * logFreqRange; // top=maxFreq
+        for (let py = 0; py < physH; py++) {
+            const yNorm = py / physH;
+            const logFreq = logMaxFreq - yNorm * logFreqRange;
             const freq = Math.pow(10, logFreq);
 
-            // Find corresponding FFT bin
             const bin = Math.round(freq / freqPerBin);
             const clampedBin = Math.max(0, Math.min(binCount - 1, bin));
 
-            // Get dB value from frame
             const db = frame[clampedBin];
             const color = dbToColor(db, minDb, maxDb);
 
-            // Write pixel (RGBA)
-            const offset = (py * activeWidth + px) * 4;
+            const offset = (py * physW + px) * 4;
             pixels[offset] = color.r;
             pixels[offset + 1] = color.g;
             pixels[offset + 2] = color.b;
@@ -291,8 +287,12 @@ export function drawSpectrogram(ctx, buffer, width, height, sampleRate, fftSize,
         }
     }
 
-    // Put the image data at the active area offset
-    ctx.putImageData(imgData, activeLeft, activeTop);
+    // Temporarily reset the transform so putImageData lands at the intended
+    // CSS-pixel position regardless of the current dpr scaling.
+    const prev = ctx.getTransform();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.putImageData(imgData, Math.round(activeLeft * pixelRatio), Math.round(activeTop * pixelRatio));
+    ctx.setTransform(prev);
 
     // ===== Draw frequency axis labels (right side of spectrogram) =====
     const freqMarkers = [50, 100, 200, 500, 1000, 2000, 5000, 10000];
