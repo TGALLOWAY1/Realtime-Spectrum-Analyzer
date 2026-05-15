@@ -116,10 +116,16 @@ let channelMergerForK = null;
 const loudnessTracker = new LoudnessTracker();
 let lastLoudnessSampleTime = -1;
 const loudnessHistory = {
-    momentary: new RollingHistory(900),
-    short: new RollingHistory(900),
-    integrated: new RollingHistory(900),
+    momentary: new RollingHistory(3600),
+    short: new RollingHistory(3600),
+    integrated: new RollingHistory(3600),
 };
+
+// Peak/RMS history for the Dynamic Range panel. Each sample is the smoothed
+// L/R peak in linear units, sampled at the same ~10 Hz tick as the loudness
+// blocks, so the two history panels share a time axis.
+const dynamicsHistory = new RollingHistory(3600);
+let historyRangeS = 60;
 
 let dashboardSmoothed = {
     peakLeftLin: 0,
@@ -160,6 +166,8 @@ let vectorscopeCanvas = null;
 let vectorscopeCtx = null;
 let loudnessHistoryCanvas = null;
 let loudnessHistoryCtx = null;
+let dynamicsCanvas = null;
+let dynamicsCtx = null;
 let spectrumTooltipEl = null;
 let lastSpectrumHover = { hz: null, db: null, x: null, y: null };
 
@@ -2344,10 +2352,14 @@ function drawSpectrogramWrapper() {
     if (spectrogramCanvas.style.width) cssWidth = parseFloat(spectrogramCanvas.style.width);
     if (spectrogramCanvas.style.height) cssHeight = parseFloat(spectrogramCanvas.style.height);
 
-    // Draw the heatmap
+    // Draw the heatmap. Pass the dpr through so the underlying putImageData
+    // fills the full CSS area (it ignores canvas transforms, so without dpr
+    // the heatmap covers only 1/dpr of the canvas width).
+    const minDbForRange = -Math.max(40, spectrogramRangeDb || 80);
     drawSpectrogram(spectrogramCtx, spectrogramBuffer, cssWidth, cssHeight, sr, fftSz, {
-        minDb: -100,
-        maxDb: -20,
+        minDb: minDbForRange,
+        maxDb: 0,
+        pixelRatio: dpr,
     });
 
     // Draw centroid + level overlay traces on top
@@ -2848,10 +2860,25 @@ function update() {
         if (isFinite(m)) loudnessHistory.momentary.push(tSec, m);
         if (isFinite(s)) loudnessHistory.short.push(tSec, s);
         if (isFinite(i)) loudnessHistory.integrated.push(tSec, i);
-        const trimBefore = tSec - 60;
+
+        // Dynamics history: store the combined-channel peak as a linear value
+        // so the waveform panel can show a stable peak envelope over the same
+        // time window as the loudness history.
+        const peakAllLin = Math.max(
+            dashboardSmoothed.peakLeftLin,
+            dashboardSmoothed.peakRightLin
+        );
+        const rmsAllLin = Math.sqrt(
+            (dashboardSmoothed.rmsLeftLin * dashboardSmoothed.rmsLeftLin +
+             dashboardSmoothed.rmsRightLin * dashboardSmoothed.rmsRightLin) * 0.5
+        );
+        dynamicsHistory.push(tSec, { peak: peakAllLin, rms: rmsAllLin });
+
+        const trimBefore = tSec - historyRangeS;
         loudnessHistory.momentary.trimOlderThan(trimBefore);
         loudnessHistory.short.trimOlderThan(trimBefore);
         loudnessHistory.integrated.trimOlderThan(trimBefore);
+        dynamicsHistory.trimOlderThan(trimBefore);
 
         updateDashboardPanels();
     }
@@ -4228,7 +4255,7 @@ function updateDashboardPanels() {
 
     const dbToPctFromBottom = (db) => {
         if (!isFinite(db)) return 0;
-        const minDb = -60;
+        const minDb = -54;
         return numClamp((db - minDb) / -minDb * 100, 0, 100);
     };
     const lDb = dashboardSmoothed.peakLeftLin > 1e-7 ? linearToDb(dashboardSmoothed.peakLeftLin) : -Infinity;
@@ -4319,6 +4346,19 @@ function drawSingleVectorscope() {
     }
 }
 
+/**
+ * Compute the shared time window (tMin..tNow) used by both the Loudness
+ * History and Dynamic Range panels. Returns null if no data has been recorded.
+ */
+function getSharedTimeWindow() {
+    const all = loudnessHistory.short.samples.length
+        ? loudnessHistory.short.samples
+        : dynamicsHistory.samples;
+    if (all.length === 0) return null;
+    const tNow = all[all.length - 1].t;
+    return { tNow, tMin: tNow - historyRangeS };
+}
+
 function drawLoudnessHistoryGraph() {
     if (!loudnessHistoryCanvas || !loudnessHistoryCtx) return;
     const ctx2 = loudnessHistoryCtx;
@@ -4339,7 +4379,6 @@ function drawLoudnessHistoryGraph() {
     const yRange = yMax - yMin;
     const yToPx = (db) => PAD_T + plotH * (1 - (numClamp(db, yMin, yMax) - yMin) / yRange);
 
-    // Grid lines + labels every 12 dB
     ctx2.strokeStyle = 'rgba(75, 85, 99, 0.35)';
     ctx2.lineWidth = 1;
     ctx2.fillStyle = '#4b5563';
@@ -4355,11 +4394,8 @@ function drawLoudnessHistoryGraph() {
         ctx2.fillText(`${db}`, PAD_L - 4, y);
     }
 
-    // X axis labels (relative time in s)
-    ctx2.textAlign = 'center';
-    ctx2.textBaseline = 'top';
-    const allSamples = loudnessHistory.short.samples;
-    if (allSamples.length === 0) {
+    const win = getSharedTimeWindow();
+    if (!win) {
         ctx2.fillStyle = '#4b5563';
         ctx2.font = '11px system-ui';
         ctx2.textAlign = 'center';
@@ -4367,15 +4403,17 @@ function drawLoudnessHistoryGraph() {
         ctx2.fillText('Press Play to start measuring loudness…', w / 2, h / 2);
         return;
     }
-    const tNow = allSamples[allSamples.length - 1].t;
-    const tMin = tNow - 60;
-    for (let dt = -60; dt <= 0; dt += 15) {
-        const x = PAD_L + plotW * ((tNow + dt - tMin) / 60);
+    const { tNow, tMin } = win;
+
+    ctx2.textAlign = 'center';
+    ctx2.textBaseline = 'top';
+    const xLabelStep = pickTimeAxisStep(historyRangeS);
+    for (let dt = -historyRangeS; dt <= 0; dt += xLabelStep) {
+        const x = PAD_L + plotW * ((tNow + dt - tMin) / historyRangeS);
         ctx2.fillStyle = '#4b5563';
-        ctx2.fillText(`${dt}s`, x, PAD_T + plotH + 2);
+        ctx2.fillText(formatTimeAxisLabel(dt, historyRangeS), x, PAD_T + plotH + 2);
     }
 
-    // Target line
     ctx2.setLineDash([4, 4]);
     ctx2.strokeStyle = 'rgba(156, 163, 175, 0.7)';
     const tgtY = yToPx(targetLufs);
@@ -4393,7 +4431,7 @@ function drawLoudnessHistoryGraph() {
         let started = false;
         for (const s of samples) {
             if (s.t < tMin) continue;
-            const x = PAD_L + plotW * ((s.t - tMin) / 60);
+            const x = PAD_L + plotW * ((s.t - tMin) / historyRangeS);
             const y = yToPx(s.value);
             if (!started) { ctx2.moveTo(x, y); started = true; }
             else ctx2.lineTo(x, y);
@@ -4406,8 +4444,124 @@ function drawLoudnessHistoryGraph() {
     drawSeries(loudnessHistory.integrated.samples, '#f472b6', 1.8);
 }
 
+function pickTimeAxisStep(rangeS) {
+    if (rangeS <= 15) return 3;
+    if (rangeS <= 30) return 5;
+    if (rangeS <= 60) return 15;
+    if (rangeS <= 120) return 30;
+    return 60;
+}
+
+function formatTimeAxisLabel(dt, rangeS) {
+    if (rangeS >= 120 && Math.abs(dt) >= 60) {
+        const m = Math.abs(dt) / 60;
+        return dt === 0 ? '0s' : `-${m % 1 === 0 ? m : m.toFixed(1)}m`;
+    }
+    return `${dt}s`;
+}
+
+function drawDynamicsHistoryWaveform() {
+    if (!dynamicsCanvas || !dynamicsCtx) return;
+    const ctx2 = dynamicsCtx;
+    const dpr = window.devicePixelRatio || 1;
+    const w = dynamicsCanvas.width / dpr;
+    const h = dynamicsCanvas.height / dpr;
+
+    ctx2.fillStyle = '#030712';
+    ctx2.fillRect(0, 0, w, h);
+
+    const PAD_L = 30, PAD_R = 6, PAD_T = 4, PAD_B = 14;
+    const plotW = w - PAD_L - PAD_R;
+    const plotH = h - PAD_T - PAD_B;
+    if (plotW <= 0 || plotH <= 0) return;
+
+    // Vertical centerline + horizontal grid at ±0.25, ±0.5, ±0.75
+    ctx2.strokeStyle = 'rgba(75, 85, 99, 0.35)';
+    ctx2.lineWidth = 1;
+    ctx2.beginPath();
+    ctx2.moveTo(PAD_L, PAD_T + plotH / 2);
+    ctx2.lineTo(PAD_L + plotW, PAD_T + plotH / 2);
+    ctx2.stroke();
+
+    ctx2.fillStyle = '#4b5563';
+    ctx2.font = '9px ui-monospace, monospace';
+    ctx2.textAlign = 'right';
+    ctx2.textBaseline = 'middle';
+    for (const frac of [0.25, 0.5, 0.75]) {
+        const yTop = PAD_T + plotH * 0.5 * (1 - frac);
+        const yBot = PAD_T + plotH * 0.5 * (1 + frac);
+        ctx2.strokeStyle = 'rgba(75, 85, 99, 0.2)';
+        ctx2.beginPath();
+        ctx2.moveTo(PAD_L, yTop);
+        ctx2.lineTo(PAD_L + plotW, yTop);
+        ctx2.moveTo(PAD_L, yBot);
+        ctx2.lineTo(PAD_L + plotW, yBot);
+        ctx2.stroke();
+    }
+    ctx2.fillText('+1', PAD_L - 4, PAD_T);
+    ctx2.fillText('0', PAD_L - 4, PAD_T + plotH / 2);
+    ctx2.fillText('-1', PAD_L - 4, PAD_T + plotH);
+
+    const win = getSharedTimeWindow();
+    if (!win || dynamicsHistory.samples.length === 0) {
+        ctx2.fillStyle = '#4b5563';
+        ctx2.font = '11px system-ui';
+        ctx2.textAlign = 'center';
+        ctx2.textBaseline = 'middle';
+        ctx2.fillText('Press Play to start measuring dynamics…', w / 2, h / 2);
+        return;
+    }
+    const { tNow, tMin } = win;
+
+    ctx2.textAlign = 'center';
+    ctx2.textBaseline = 'top';
+    const xLabelStep = pickTimeAxisStep(historyRangeS);
+    for (let dt = -historyRangeS; dt <= 0; dt += xLabelStep) {
+        const x = PAD_L + plotW * ((tNow + dt - tMin) / historyRangeS);
+        ctx2.fillStyle = '#4b5563';
+        ctx2.fillText(formatTimeAxisLabel(dt, historyRangeS), x, PAD_T + plotH + 2);
+    }
+
+    // Two-pass fill: peak envelope (light cyan) under, RMS envelope (darker cyan) over.
+    const drawEnvelope = (extractor, fill, stroke) => {
+        const samples = dynamicsHistory.samples;
+        let started = false;
+        ctx2.fillStyle = fill;
+        ctx2.beginPath();
+        for (const s of samples) {
+            if (s.t < tMin) continue;
+            const v = extractor(s.value);
+            const x = PAD_L + plotW * ((s.t - tMin) / historyRangeS);
+            const yTop = PAD_T + plotH * 0.5 * (1 - numClamp(v, 0, 1));
+            if (!started) { ctx2.moveTo(x, yTop); started = true; }
+            else ctx2.lineTo(x, yTop);
+        }
+        for (let i = samples.length - 1; i >= 0; i--) {
+            const s = samples[i];
+            if (s.t < tMin) continue;
+            const v = extractor(s.value);
+            const x = PAD_L + plotW * ((s.t - tMin) / historyRangeS);
+            const yBot = PAD_T + plotH * 0.5 * (1 + numClamp(v, 0, 1));
+            ctx2.lineTo(x, yBot);
+        }
+        if (started) {
+            ctx2.closePath();
+            ctx2.fill();
+        }
+        if (stroke && started) {
+            ctx2.strokeStyle = stroke;
+            ctx2.lineWidth = 1;
+            ctx2.stroke();
+        }
+    };
+
+    drawEnvelope((v) => v.peak || 0, 'rgba(56, 189, 248, 0.35)', null);
+    drawEnvelope((v) => v.rms  || 0, 'rgba(56, 189, 248, 0.85)', 'rgba(125, 211, 252, 0.9)');
+}
+
 function drawDashboardCanvases() {
     drawSingleVectorscope();
+    drawDynamicsHistoryWaveform();
     drawLoudnessHistoryGraph();
 }
 
@@ -4520,6 +4674,15 @@ function setupDashboardWiring() {
         spectrogramOverlayMode = sgOverlay.value || 'both';
     });
 
+    // Shared History Range select (affects Dynamic Range + Loudness History)
+    const rangeSel = document.getElementById('history-range');
+    if (rangeSel) {
+        rangeSel.addEventListener('change', () => {
+            const v = parseFloat(rangeSel.value);
+            if (isFinite(v) && v > 0) historyRangeS = v;
+        });
+    }
+
     // Reset stats
     const resetBtn = document.getElementById('reset-stats');
     if (resetBtn) resetBtn.addEventListener('click', () => {
@@ -4529,6 +4692,7 @@ function setupDashboardWiring() {
         loudnessHistory.momentary.reset();
         loudnessHistory.short.reset();
         loudnessHistory.integrated.reset();
+        dynamicsHistory.reset();
         updateDashboardPanels();
     });
 }
@@ -4538,6 +4702,8 @@ function initDashboardCanvases() {
     vectorscopeCtx = vectorscopeCanvas ? vectorscopeCanvas.getContext('2d') : null;
     loudnessHistoryCanvas = document.getElementById('loudness-history-canvas');
     loudnessHistoryCtx = loudnessHistoryCanvas ? loudnessHistoryCanvas.getContext('2d') : null;
+    dynamicsCanvas = document.getElementById('dynamics-canvas');
+    dynamicsCtx = dynamicsCanvas ? dynamicsCanvas.getContext('2d') : null;
 
     const fitCanvas = (cnv) => {
         if (!cnv) return;
@@ -4557,12 +4723,14 @@ function initDashboardCanvases() {
     };
     fitCanvas(vectorscopeCanvas);
     fitCanvas(loudnessHistoryCanvas);
+    fitCanvas(dynamicsCanvas);
 
     window.addEventListener('resize', () => {
         clearTimeout(initDashboardCanvases._resizeTo);
         initDashboardCanvases._resizeTo = setTimeout(() => {
             fitCanvas(vectorscopeCanvas);
             fitCanvas(loudnessHistoryCanvas);
+            fitCanvas(dynamicsCanvas);
         }, 100);
     });
 }
